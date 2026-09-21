@@ -87,6 +87,16 @@
         <div id="col-btn-wrap" class="col-btn-wrap">
           <button class="tb-btn" id="col-btn">Columns &#9660;</button>
         </div>
+        <!-- Folder browser: hierarchical navigator built from sharePointPath.
+             Opens a compact dropdown with the current folder's direct children;
+             breadcrumb below the toolbar shows/edits the active folder path. -->
+        <div id="folder-btn-wrap" class="col-btn-wrap">
+          <button class="tb-btn" id="folder-btn" type="button" title="Browse folders">
+            <span class="folder-btn-icon" aria-hidden="true">&#128193;</span>
+            <span id="folder-btn-label">All Contracts</span>
+            <span aria-hidden="true">&#9660;</span>
+          </button>
+        </div>
       </div>
       <div class="tb-right">
         <button class="tb-btn tb-export-btn" id="export-csv-btn" type="button" title="Export current filtered results as CSV">
@@ -95,6 +105,11 @@
         </button>
       </div>
     </div>
+
+    <!-- Folder breadcrumb — visible whenever any folder is selected below the
+         virtual root.  Each segment is clickable; last segment is the current
+         folder.  Hidden entirely when scope = All Contracts (root). -->
+    <div class="folder-crumb" id="folder-crumb" style="display:none"></div>
 
     <!-- Active filter chips -->
     <div class="af-bar" id="af-bar" style="display:none"></div>

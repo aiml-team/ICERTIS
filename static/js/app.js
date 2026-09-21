@@ -71,6 +71,20 @@ const state = {
   // reported separately via `excluded`).  Kept in sync with state.allData
   // by exclude/restore flows so a reload without a refetch stays correct.
   populationCounts:   { active: 0, excluded: 0, total: 0 },
+
+  /* ── Folder navigator ──────────────────────────────────────────────────
+   * Derived at load-time from row.sharePointPath and rebuilt whenever
+   * state.allData changes (exclude / restore).  folderPath is the array
+   * of segment names representing the currently-selected scope; empty
+   * array = root ("All Contracts") = show everything.
+   *
+   * folderTree is a nested { name, children:Map<name,node>, count } map;
+   * folderIndex is a per-row Set of ancestor-path keys so recursive
+   * filtering is O(1) per row.  Both are built by rebuildFolderTree().
+   * ─────────────────────────────────────────────────────────────────── */
+  folderPath:  [],
+  folderTree:  null,
+  folderIndex: new WeakMap(),  // row → Set<pathKey>
 };
 
 // Restore hidden cols from localStorage; ensure migration columns are always visible
@@ -219,8 +233,127 @@ function passesFilter(row, field, filter) {
 function isMigrated(row) { return row.migrate === 'Yes'; }
 function isPending(row)  { return !isMigrated(row); }
 
+/* ── Folder navigation ────────────────────────────────────────────────────
+ * Derive a business-folder hierarchy from row.sharePointPath.  The virtual
+ * root "All Contracts" is always the top; below it we surface the ACTUAL
+ * folder segments from the data, dynamically.  No DB columns are created.
+ *
+ * Technical URL parts (scheme, host, /sites/<site-name>/, and any literal
+ * "Shared Documents" segment) are stripped.  If a path already contains an
+ * "All Contracts" segment, it's collapsed so we never nest the virtual root
+ * inside itself.  The trailing filename is always removed.
+ * ────────────────────────────────────────────────────────────────────────── */
+const FOLDER_ROOT_LABEL = 'All Contracts';
+
+// Segments that appear in SharePoint URLs but have no business meaning.
+// Matched case-insensitively.  If the raw path contains them we skip them
+// while walking segments so the browser starts at the real business root.
+const _TECHNICAL_SEG_RE = /^(shared\s*documents|documents|forms|allitems\.aspx?)$/i;
+
+function _folderSegmentsFor(row) {
+  const raw = row && row.sharePointPath;
+  if (!raw || typeof raw !== 'string') return [];
+  // Strip query/fragment
+  let s = raw.split('#')[0].split('?')[0];
+
+  let segs;
+  if (/^https?:\/\//i.test(s)) {
+    // Full URL: parse and drop scheme+host+/sites/<site>/ prefix.
+    let url;
+    try { url = new URL(s); } catch { return []; }
+    const parts = url.pathname.split('/').filter(Boolean);
+    // Drop leading /sites/<site-name>/ pair when present.
+    if (parts[0] && parts[0].toLowerCase() === 'sites' && parts.length >= 2) {
+      parts.splice(0, 2);
+    }
+    segs = parts;
+  } else {
+    // Non-URL: treat as a POSIX/Windows-style path.
+    segs = s.replace(/\\/g, '/').split('/').filter(Boolean);
+  }
+
+  // Decode + drop technical noise + drop the trailing filename.
+  const decoded = segs.map(seg => {
+    try { return decodeURIComponent(seg); } catch { return seg; }
+  }).filter(seg => seg && !_TECHNICAL_SEG_RE.test(seg));
+
+  if (decoded.length === 0) return [];
+  // Drop trailing filename (anything with an extension after the last dot).
+  // Files often have . in the name too — only drop if the LAST segment has
+  // a short (1-6 char) alphanumeric extension.
+  const last = decoded[decoded.length - 1];
+  if (/\.[A-Za-z0-9]{1,6}$/.test(last)) decoded.pop();
+
+  // Collapse a literal "All Contracts" segment anywhere in the chain —
+  // we render the virtual root separately so nesting it would duplicate.
+  return decoded.filter(seg => seg.toLowerCase() !== FOLDER_ROOT_LABEL.toLowerCase());
+}
+
+function _makeFolderNode(name) {
+  return { name, children: new Map(), count: 0 };
+}
+
+/**
+ * Rebuild the folder tree + per-row ancestor-key index from state.allData.
+ * Called on initial load and after exclude/restore mutations so the browser
+ * always reflects the current active dataset.  O(rows × max depth).
+ */
+function rebuildFolderTree() {
+  const root  = _makeFolderNode(FOLDER_ROOT_LABEL);
+  const index = new WeakMap();
+
+  for (const row of state.allData) {
+    const segs = _folderSegmentsFor(row);
+    // Every row is under the virtual root (empty ancestor key set = "").
+    const keys = new Set(['']);
+    let node = root;
+    root.count++;
+    let acc = '';
+    for (const seg of segs) {
+      let child = node.children.get(seg);
+      if (!child) {
+        child = _makeFolderNode(seg);
+        node.children.set(seg, child);
+      }
+      child.count++;
+      acc = acc ? `${acc}/${seg}` : seg;
+      keys.add(acc);
+      node = child;
+    }
+    index.set(row, keys);
+  }
+  state.folderTree  = root;
+  state.folderIndex = index;
+}
+
+/** Return the child map of the node at the given path (empty path = root). */
+function _folderNodeAt(pathArr) {
+  let node = state.folderTree;
+  if (!node) return null;
+  for (const seg of pathArr) {
+    const nxt = node.children.get(seg);
+    if (!nxt) return null;
+    node = nxt;
+  }
+  return node;
+}
+
+/** True when the row lives under state.folderPath (recursive match). */
+function _rowInSelectedFolder(row) {
+  if (!state.folderPath.length) return true;                    // root scope
+  const keys = state.folderIndex.get(row);
+  if (!keys) return false;
+  return keys.has(state.folderPath.join('/'));
+}
+
 function applyFiltersAndSort() {
   let d = state.allData;
+
+  // Folder scope: applied FIRST so column-filter dropdowns show values that
+  // are consistent with the currently-visible subtree.  Empty path = no-op.
+  if (state.folderPath.length) {
+    d = d.filter(_rowInSelectedFolder);
+  }
 
   // Bucket filter (migration status): applied first so column filters still narrow further
   if (state.bucketFilter === 'migrated')      d = d.filter(isMigrated);
@@ -540,7 +673,8 @@ function updateToolbar() {
 
   const hasFilters = Object.values(state.columnFilters).some(Boolean)
                      || state.globalSearch
-                     || state.bucketFilter !== 'all';
+                     || state.bucketFilter !== 'all'
+                     || state.folderPath.length > 0;
   $('clear-filters-btn').disabled = !hasFilters;
 }
 
@@ -687,6 +821,153 @@ function renderAll() {
   updateFooter();
   renderActiveFilters();
   updateBuckets();
+  renderFolderControl();
+}
+
+/* ── Folder control render (button label + breadcrumb bar) ────────────── */
+function renderFolderControl() {
+  const label = $('folder-btn-label');
+  const crumb = $('folder-crumb');
+  const btn   = $('folder-btn');
+  if (!label || !crumb || !btn) return;
+
+  if (state.folderPath.length === 0) {
+    label.textContent = FOLDER_ROOT_LABEL;
+    btn.classList.remove('has-selection');
+    crumb.style.display = 'none';
+    crumb.innerHTML = '';
+    return;
+  }
+  // Button label = current (deepest) folder name for compactness.
+  label.textContent = state.folderPath[state.folderPath.length - 1];
+  btn.classList.add('has-selection');
+
+  // Breadcrumb: virtual root + every segment; last one is non-clickable.
+  const parts = [FOLDER_ROOT_LABEL, ...state.folderPath];
+  const segsHtml = parts.map((name, i) => {
+    const isLast = i === parts.length - 1;
+    const cls = isLast ? 'folder-crumb-segment current' : 'folder-crumb-segment';
+    const html = `<button type="button" class="${cls}" data-depth="${i}" title="${esc(name)}">${esc(name)}</button>`;
+    return i === 0 ? html : `<span class="folder-crumb-sep">›</span>${html}`;
+  }).join('');
+  crumb.innerHTML = `<span class="folder-crumb-label">Folder:</span>${segsHtml}` +
+                    `<button type="button" class="folder-crumb-clear" id="folder-crumb-clear" title="Reset to All Contracts">Show All</button>`;
+  crumb.style.display = 'flex';
+
+  crumb.querySelectorAll('.folder-crumb-segment').forEach(b => {
+    b.addEventListener('click', () => {
+      const depth = parseInt(b.dataset.depth, 10);
+      // depth 0 = virtual root → empty path; depth N = keep first N segments.
+      state.folderPath = state.folderPath.slice(0, depth);
+      state.page = 1;
+      applyFiltersAndSort();
+      renderAll();
+    });
+  });
+  const clearBtn = $('folder-crumb-clear');
+  if (clearBtn) clearBtn.addEventListener('click', () => {
+    state.folderPath = [];
+    state.page = 1;
+    applyFiltersAndSort();
+    renderAll();
+  });
+}
+
+/* ── Folder dropdown (compact browser) ────────────────────────────────── */
+function openFolderPanel() {
+  closeFolderPanel();
+  const wrap = $('folder-btn-wrap');
+  if (!wrap || !state.folderTree) return;
+
+  const node = _folderNodeAt(state.folderPath);
+  const children = node ? [...node.children.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+  ) : [];
+
+  const crumbTxt = [FOLDER_ROOT_LABEL, ...state.folderPath].join(' › ');
+  const backHtml = state.folderPath.length > 0
+    ? `<button type="button" class="folder-panel-back" id="folder-back">↑ Up to ${esc(state.folderPath.length === 1 ? FOLDER_ROOT_LABEL : state.folderPath[state.folderPath.length - 2])}</button>`
+    : '';
+
+  const listHtml = children.length === 0
+    ? '<div class="folder-panel-empty">No subfolders</div>'
+    : children.map(c => `
+        <div class="folder-item" data-name="${esc(c.name)}" title="${esc(c.name)}">
+          <span class="folder-item-icon">📁</span>
+          <span class="folder-item-name">${esc(c.name)}</span>
+          <span class="folder-item-count">${c.count.toLocaleString()}</span>
+          <span class="folder-item-arrow">›</span>
+        </div>`).join('');
+
+  const html = `
+    <div class="folder-panel" id="folder-panel" role="menu">
+      <div class="folder-panel-header">
+        <span class="folder-btn-icon">📁</span>
+        <span>Folders</span>
+        <button type="button" class="fp-close" id="folder-panel-close" aria-label="Close">✕</button>
+      </div>
+      <div class="folder-panel-current">
+        Current: <strong>${esc(crumbTxt)}</strong>
+      </div>
+      ${backHtml}
+      <div class="folder-panel-list" id="folder-panel-list">${listHtml}</div>
+      <div class="folder-panel-footer">
+        <button type="button" class="folder-showall" id="folder-panel-showall">Show All</button>
+        <span style="color:#9ca3af;font-size:11px">${node ? node.count.toLocaleString() : 0} in scope</span>
+      </div>
+    </div>`;
+  wrap.insertAdjacentHTML('beforeend', html);
+
+  const panel = $('folder-panel');
+  panel.querySelectorAll('.folder-item').forEach(el => {
+    el.addEventListener('click', () => {
+      state.folderPath = [...state.folderPath, el.dataset.name];
+      state.page = 1;
+      applyFiltersAndSort();
+      renderAll();
+      // Reopen so user can drill deeper without closing.
+      openFolderPanel();
+    });
+  });
+  const back = $('folder-back');
+  if (back) back.addEventListener('click', () => {
+    state.folderPath = state.folderPath.slice(0, -1);
+    state.page = 1;
+    applyFiltersAndSort();
+    renderAll();
+    openFolderPanel();
+  });
+  $('folder-panel-close').addEventListener('click', closeFolderPanel);
+  $('folder-panel-showall').addEventListener('click', () => {
+    state.folderPath = [];
+    state.page = 1;
+    applyFiltersAndSort();
+    renderAll();
+    closeFolderPanel();
+  });
+
+  // Click-outside to close.  Registered async so the opening click doesn't
+  // immediately close the just-opened panel.
+  setTimeout(() => {
+    document.addEventListener('mousedown', _folderPanelOutside);
+    document.addEventListener('keydown', _folderPanelEsc);
+  }, 0);
+}
+
+function _folderPanelOutside(e) {
+  const panel = document.getElementById('folder-panel');
+  const btn = document.getElementById('folder-btn');
+  if (!panel) return;
+  if (panel.contains(e.target) || (btn && btn.contains(e.target))) return;
+  closeFolderPanel();
+}
+function _folderPanelEsc(e) { if (e.key === 'Escape') closeFolderPanel(); }
+
+function closeFolderPanel() {
+  const p = document.getElementById('folder-panel');
+  if (p) p.remove();
+  document.removeEventListener('mousedown', _folderPanelOutside);
+  document.removeEventListener('keydown', _folderPanelEsc);
 }
 
 /* ── Column resize ──────────────────────────────────────────────────────── */
@@ -1526,6 +1807,9 @@ async function performExclusion(ids) {
   // change immediately without a network round-trip.
   state.excludedData = movedRows.concat(state.excludedData);
 
+  // Rebuild the folder tree so folder counts reflect the new active set.
+  rebuildFolderTree();
+
   applyFiltersAndSort();
   renderAll();
 
@@ -1843,6 +2127,9 @@ async function performRestoration(ids) {
     state.populationCounts.excluded = Math.max(0, state.populationCounts.excluded - succeededSet.size);
     state.populationCounts.total    = state.populationCounts.active;
 
+    // Rebuild folder tree so restored rows appear in the folder counts.
+    rebuildFolderTree();
+
     applyFiltersAndSort();
     renderExcludedTable();
     updateExcludedToolbar();
@@ -1966,7 +2253,12 @@ function initSourceScreen() {
     state.sortDir       = null;
     state.selectedIds.clear();
     state.bucketFilter  = 'all';
+    state.folderPath    = [];
     state.page = 1;
+
+    // Build the folder tree ONCE from state.allData; exclude/restore keep
+    // it in sync by calling rebuildFolderTree() after mutating allData.
+    rebuildFolderTree();
 
     applyFiltersAndSort();
     showScreen('review');
@@ -2043,6 +2335,7 @@ function initReviewEventListeners() {
     state.sortCol = null;
     state.sortDir = null;
     state.bucketFilter = 'all';
+    state.folderPath = [];                 // reset folder scope to All Contracts
     applyFiltersAndSort();
     renderAll();
   });
@@ -2051,6 +2344,13 @@ function initReviewEventListeners() {
   $('migrate-btn').addEventListener('click', openMigrateModal);
   $('exclude-btn').addEventListener('click', openExcludeModal);
   $('export-csv-btn').addEventListener('click', exportCsv);
+  // Folder browser button — toggles the compact folder dropdown.
+  const folderBtn = $('folder-btn');
+  if (folderBtn) folderBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    if (document.getElementById('folder-panel')) closeFolderPanel();
+    else openFolderPanel();
+  });
 
   // Restore + back-to-review buttons (Excluded view)
   const restoreBtn = $('restore-btn');
