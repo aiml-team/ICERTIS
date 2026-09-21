@@ -26,9 +26,17 @@ from core.config import settings
 from core.database import (
     ensure_excluded_column,
     ensure_excluded_table,
+    ensure_migration_status_column,
     excluded_table_name,
     get_connection,
 )
+
+# Canonical MigrationStatus values.  Kept as constants so callers can never
+# introduce drift via typos.  All comparisons/writes go through these.
+STATUS_PENDING       = "Pending"
+STATUS_IN_PROCESSING = "In Processing"
+STATUS_MIGRATED      = "Migrated"
+STATUS_FAILED        = "Failed"
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +55,7 @@ def _ensure_schema_once() -> None:
     try:
         ensure_excluded_column()
         ensure_excluded_table()
+        ensure_migration_status_column()
         _migrate_legacy_excluded_rows()
         _schema_ready = True
     except Exception as exc:
@@ -115,7 +124,7 @@ _COLUMNS = [
     "TypeOfContract", "AssociatedMSAFileName", "AssociatedNDAFileName",
     "VoidExclusionIndicator", "ExtractionStatus", "ReviewRequired",
     "MissingFields", "ProcessedDate", "ErrorMessage", "RunId",
-    "Migrate", "Migrated", "MigratedDate",
+    "Migrate", "Migrated", "MigratedDate", "MigrationStatus",
 ]
 
 
@@ -194,6 +203,9 @@ def _row_to_dict(row) -> dict:
                                         else "No",
         "migrated":               _parse_bool_str(r["Migrated"]),
         "migratedDate":           _fmt_dt(r["MigratedDate"]),
+        # Canonical status field — one of: Pending / In Processing / Migrated / Failed.
+        # UI treats this as the source of truth for bucket assignment.
+        "migrationStatus":        _s(r["MigrationStatus"]) or STATUS_PENDING,
     }
 
 
@@ -240,13 +252,20 @@ def load_excluded() -> List[dict]:
 
 
 def count_all() -> dict:
-    """Return {active, excluded, total}.
+    """Return per-bucket population counts.
 
-    IMPORTANT — semantics: "total" is the ACTIVE document count, i.e. the
-    documents currently available for review/migration.  Excluded records
-    live in a separate table and are surfaced only via the "excluded" key.
-    This matches the UI's Total Documents bucket, which shows only active
-    rows (a Pending+Migrated+Excluded=Total identity does NOT hold).
+    Response keys:
+        active         — rows in the active table (Pending + In Processing + Migrated + Failed)
+        excluded       — rows in the excluded table
+        total          — same as active (Total Documents bucket)
+        pending        — rows with MigrationStatus = 'Pending'
+        in_processing  — rows with MigrationStatus = 'In Processing'
+        migrated       — rows with MigrationStatus = 'Migrated'
+        failed         — rows with MigrationStatus = 'Failed'
+
+    NOTE — "total" continues to be the ACTIVE count only (not active + excluded)
+    so the existing UI identity Pending + In Processing + Migrated == Total
+    still holds within the active table.
     """
     _ensure_schema_once()
     active = settings.CONTRACT_TABLE
@@ -257,48 +276,215 @@ def count_all() -> dict:
         a = cur.fetchone()[0] or 0
         cur.execute(f"SELECT COUNT(*) FROM dbo.[{ex}]")
         e = cur.fetchone()[0] or 0
-    return {"active": int(a), "excluded": int(e), "total": int(a)}
+        # Per-status counts on the active table.  Uses ISNULL so any
+        # pre-existing NULL rows land in Pending (matches column default).
+        cur.execute(
+            f"SELECT ISNULL([MigrationStatus], '{STATUS_PENDING}') AS s, COUNT(*) "
+            f"FROM dbo.[{active}] GROUP BY ISNULL([MigrationStatus], '{STATUS_PENDING}')"
+        )
+        by_status = {str(row[0] or STATUS_PENDING): int(row[1] or 0) for row in cur.fetchall()}
+    return {
+        "active":        int(a),
+        "excluded":      int(e),
+        "total":         int(a),
+        "pending":       by_status.get(STATUS_PENDING, 0),
+        "in_processing": by_status.get(STATUS_IN_PROCESSING, 0),
+        "migrated":      by_status.get(STATUS_MIGRATED, 0),
+        "failed":        by_status.get(STATUS_FAILED, 0),
+    }
 
 
 # ── Writes ─────────────────────────────────────────────────────────────────
-def mark_migrated(file_ids: Iterable[str], migrated_at: datetime | None = None) -> dict:
-    """Mark ONLY the given FileIDs as Migrate='Yes' + set MigratedDate.
+def mark_in_processing(file_ids: Iterable[str]) -> dict:
+    """Transition eligible rows from 'Pending' → 'In Processing'.
 
-    Uses parameterised queries.  Returns counts + timestamp.
+    Called immediately after the user confirms the Migrate modal, BEFORE
+    the Power Automate call.  Persisting this state first ensures:
+      - the Pending bucket count drops right away (UI feels responsive),
+      - if the Power Automate call crashes or times out we can still see
+        which files were in flight,
+      - Migrate=Yes and MigratedDate are NOT touched (business rule 4).
+
+    Only rows currently in 'Pending' are transitioned — already-processing
+    or already-migrated rows are silently skipped (business rule 15).
+    Returns which FileIDs actually flipped so the caller can send exactly
+    those to Power Automate.
     """
+    _ensure_schema_once()
     ids = [str(i).strip() for i in file_ids if str(i).strip()]
     if not ids:
-        return {"succeeded": [], "failed": [], "migratedAt": None, "rowsAffected": 0}
+        return {"succeeded": [], "skipped": [], "rowsAffected": 0}
+
+    table = settings.CONTRACT_TABLE
+    placeholders = ", ".join("?" for _ in ids)
+
+    with get_connection() as cn:
+        cn.autocommit = False
+        cur = cn.cursor()
+        try:
+            # Eligible transitions to In Processing:
+            #   Pending → In Processing   (first-time migration)
+            #   Failed  → In Processing   (user retry after a prior failure)
+            # Never touch rows that are already 'In Processing' (duplicate
+            # submit) or 'Migrated' (§15 — cannot re-migrate).
+            cur.execute(
+                f"UPDATE dbo.[{table}] "
+                f"SET [MigrationStatus] = ? "
+                f"WHERE [FileID] IN ({placeholders}) "
+                f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') IN "
+                f"       ('{STATUS_PENDING}', '{STATUS_FAILED}') "
+                f"  AND ISNULL([Migrate], 'No') <> 'Yes'",
+                [STATUS_IN_PROCESSING, *ids],
+            )
+            affected = cur.rowcount
+
+            # Capture which IDs actually made it into In Processing.
+            cur.execute(
+                f"SELECT [FileID] FROM dbo.[{table}] "
+                f"WHERE [FileID] IN ({placeholders}) "
+                f"  AND [MigrationStatus] = ?",
+                [*ids, STATUS_IN_PROCESSING],
+            )
+            succeeded = [str(r[0]) for r in cur.fetchall()]
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
+
+    skipped = [i for i in ids if i not in set(succeeded)]
+    logger.info(
+        "mark_in_processing: requested=%d affected=%d skipped=%d table=dbo.%s",
+        len(ids), affected, len(skipped), table,
+    )
+    return {"succeeded": succeeded, "skipped": skipped, "rowsAffected": affected}
+
+
+def apply_migration_result(
+    succeeded_ids: Iterable[str],
+    failed_ids: Iterable[str],
+    migrated_at: datetime | None = None,
+) -> dict:
+    """Apply Power Automate's per-document outcome to the database.
+
+    For each SUCCEEDED FileID (Power Automate confirmed the copy):
+        MigrationStatus = 'Migrated'
+        Migrate         = 'Yes'
+        Migrated        = 'True'
+        MigratedDate    = <ts>
+
+    For each FAILED FileID:
+        MigrationStatus = 'Failed'
+        Migrate         = 'No'       (unchanged; FAILED != MIGRATED)
+        MigratedDate    = <untouched>
+
+    Only rows currently 'In Processing' are updated on either side — this
+    protects against duplicate/late webhook calls trying to re-flip an
+    already-Migrated row.
+    """
+    _ensure_schema_once()
+    succ = [str(i).strip() for i in succeeded_ids if str(i).strip()]
+    fail = [str(i).strip() for i in failed_ids    if str(i).strip()]
+    if not succ and not fail:
+        return {"migrated": [], "failed": [], "migratedAt": None}
 
     ts = migrated_at or datetime.now()
     table = settings.CONTRACT_TABLE
 
-    # Only flip rows that are still pending — never re-stamp an already
-    # migrated document (protects any auditor timestamp on re-runs).
-    placeholders = ", ".join("?" for _ in ids)
-    sql = (
-        f"UPDATE dbo.[{table}] "
-        f"SET [Migrate] = 'Yes', [Migrated] = 'True', [MigratedDate] = ? "
-        f"WHERE [FileID] IN ({placeholders}) AND (ISNULL([Migrate], 'No') <> 'Yes')"
-    )
-    params = [ts, *ids]
-
     with get_connection() as cn:
+        cn.autocommit = False
         cur = cn.cursor()
-        cur.execute(sql, params)
-        affected = cur.rowcount
-        cn.commit()
+        try:
+            migrated_written = []
+            failed_written   = []
+
+            if succ:
+                ph = ", ".join("?" for _ in succ)
+                cur.execute(
+                    f"UPDATE dbo.[{table}] "
+                    f"SET [MigrationStatus] = '{STATUS_MIGRATED}', "
+                    f"    [Migrate] = 'Yes', "
+                    f"    [Migrated] = 'True', "
+                    f"    [MigratedDate] = ? "
+                    f"WHERE [FileID] IN ({ph}) "
+                    f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'",
+                    [ts, *succ],
+                )
+                cur.execute(
+                    f"SELECT [FileID] FROM dbo.[{table}] "
+                    f"WHERE [FileID] IN ({ph}) AND [MigrationStatus] = '{STATUS_MIGRATED}'",
+                    succ,
+                )
+                migrated_written = [str(r[0]) for r in cur.fetchall()]
+
+            if fail:
+                ph = ", ".join("?" for _ in fail)
+                cur.execute(
+                    f"UPDATE dbo.[{table}] "
+                    f"SET [MigrationStatus] = '{STATUS_FAILED}' "
+                    f"WHERE [FileID] IN ({ph}) "
+                    f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'",
+                    fail,
+                )
+                cur.execute(
+                    f"SELECT [FileID] FROM dbo.[{table}] "
+                    f"WHERE [FileID] IN ({ph}) AND [MigrationStatus] = '{STATUS_FAILED}'",
+                    fail,
+                )
+                failed_written = [str(r[0]) for r in cur.fetchall()]
+
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
 
     logger.info(
-        "mark_migrated: requested=%d affected=%d table=dbo.%s",
-        len(ids), affected, table,
+        "apply_migration_result: migrated=%d failed=%d table=dbo.%s",
+        len(migrated_written), len(failed_written), table,
     )
     return {
-        "succeeded":    ids,
-        "failed":       [],
-        "migratedAt":   _fmt_dt(ts),
-        "rowsAffected": affected,
+        "migrated":   migrated_written,
+        "failed":     failed_written,
+        "migratedAt": _fmt_dt(ts),
     }
+
+
+def get_documents_for_migration(file_ids: Iterable[str]) -> List[dict]:
+    """Return the minimal set of fields Power Automate needs to copy each
+    file (FileID + FileName + source SharePoint URL + a few metadata bits
+    for auditing).  Only returns rows currently 'In Processing' — this
+    guarantees we never send a Pending or Migrated row to Power Automate."""
+    _ensure_schema_once()
+    ids = [str(i).strip() for i in file_ids if str(i).strip()]
+    if not ids:
+        return []
+    table = settings.CONTRACT_TABLE
+    ph = ", ".join("?" for _ in ids)
+    sql = (
+        f"SELECT [FileID], [FileName], [SharePointPath], [CustomerName], "
+        f"       [AgreementName], [ContractType] "
+        f"FROM dbo.[{table}] "
+        f"WHERE [FileID] IN ({ph}) "
+        f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'"
+    )
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(sql, ids)
+        rows = cur.fetchall()
+    return [
+        {
+            "fileID":         _s(r[0]) or "",
+            "fileName":       _s(r[1]) or "",
+            "sharePointPath": _s(r[2]),
+            "customerName":   _s(r[3]),
+            "agreementName":  _s(r[4]),
+            "contractType":   _s(r[5]),
+        }
+        for r in rows
+    ]
 
 
 def mark_excluded(file_ids: Iterable[str]) -> dict:
@@ -334,14 +520,16 @@ def mark_excluded(file_ids: Iterable[str]) -> dict:
         cur = cn.cursor()
         try:
             # Step 1 — copy eligible rows into the excluded table.  Skip rows
-            # that are already migrated (business rule) or already excluded
-            # (dedup safety).
+            # that are already migrated (business rule), currently 'In Processing'
+            # (must not disturb an in-flight Power Automate copy), or already
+            # excluded (dedup safety).
             cur.execute(
                 f"INSERT INTO dbo.[{ex}] ({copy_cols}, [ExcludedDate]) "
                 f"SELECT {copy_cols}, ? "
                 f"FROM dbo.[{active}] "
                 f"WHERE [FileID] IN ({placeholders}) "
                 f"  AND ISNULL([Migrate], 'No') <> 'Yes' "
+                f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') <> '{STATUS_IN_PROCESSING}' "
                 f"  AND [FileID] NOT IN (SELECT [FileID] FROM dbo.[{ex}])",
                 [now, *ids],
             )

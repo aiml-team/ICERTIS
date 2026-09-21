@@ -48,9 +48,12 @@ const state = {
   page:             1,
   activeFilter:     null,
   showColPanel:     false,
-  // migration-status bucket filter: 'all' | 'migrated' | 'pending' | 'selected'
+  // migration-status bucket filter: 'all' | 'migrated' | 'pending'
+  //                                | 'in_processing'
   // Note: 'excluded' is NOT a filter — clicking that bucket switches to a
   // separate view (state.currentView = 'excluded').
+  // 'selected' bucket was removed from the KPI row; the value 'selected'
+  // is retained here only as legacy no-op to keep older bookmarks safe.
   bucketFilter:     'all',
   // records fetched from the database via /api/contracts on Start
   sourceData:       [],
@@ -230,8 +233,42 @@ function passesFilter(row, field, filter) {
   return true;
 }
 
-function isMigrated(row) { return row.migrate === 'Yes'; }
-function isPending(row)  { return !isMigrated(row); }
+/* ── Migration status ─────────────────────────────────────────────────────
+ * Canonical values (must match services.data_service constants):
+ *   'Pending'        eligible for selection + migration
+ *   'In Processing'  user confirmed Migrate; Power Automate call in flight
+ *   'Migrated'       Power Automate confirmed success + MigratedDate set
+ *   'Failed'         Power Automate confirmed failure (Migrate stays No)
+ *
+ * The DB is the source of truth for `row.migrationStatus`.  The legacy
+ * `row.migrate === 'Yes'` flag is derived from Migrated and is kept in
+ * sync so any older reader keeps working.
+ * ─────────────────────────────────────────────────────────────────────── */
+const STATUS = Object.freeze({
+  PENDING:       'Pending',
+  IN_PROCESSING: 'In Processing',
+  MIGRATED:      'Migrated',
+  FAILED:        'Failed',
+});
+
+function rowStatus(row) {
+  // Prefer the explicit status field; fall back to Migrate=Yes for
+  // rows that arrived from a very old response shape.
+  if (row && row.migrationStatus) return row.migrationStatus;
+  if (row && row.migrate === 'Yes') return STATUS.MIGRATED;
+  return STATUS.PENDING;
+}
+
+function isMigrated(row)     { return rowStatus(row) === STATUS.MIGRATED; }
+function isInProcessing(row) { return rowStatus(row) === STATUS.IN_PROCESSING; }
+function isFailed(row)       { return rowStatus(row) === STATUS.FAILED; }
+// "Pending" here means "eligible to be selected/migrated" — i.e. NOT in
+// any of the three terminal/in-flight states.
+function isPending(row)      { const s = rowStatus(row); return s !== STATUS.MIGRATED && s !== STATUS.IN_PROCESSING; }
+// Everything except Migrated + In Processing is selectable (Pending + Failed).
+// Failed rows CAN be retried by the user — spec §10 leaves this open, and
+// keeping them selectable matches the "return to pending or failed" wording.
+function isSelectable(row)   { const s = rowStatus(row); return s !== STATUS.MIGRATED && s !== STATUS.IN_PROCESSING; }
 
 /* ── Folder navigation ────────────────────────────────────────────────────
  * Derive a business-folder hierarchy from row.sharePointPath.  The virtual
@@ -356,9 +393,12 @@ function applyFiltersAndSort() {
   }
 
   // Bucket filter (migration status): applied first so column filters still narrow further
-  if (state.bucketFilter === 'migrated')      d = d.filter(isMigrated);
-  else if (state.bucketFilter === 'pending')  d = d.filter(isPending);
-  else if (state.bucketFilter === 'selected') d = d.filter(r => state.selectedIds.has(r.fileID));
+  if (state.bucketFilter === 'migrated')            d = d.filter(isMigrated);
+  else if (state.bucketFilter === 'in_processing')  d = d.filter(isInProcessing);
+  // "Pending" bucket shows only rows eligible for migration selection —
+  // Failed rows are kept out so the user isn't misled about retry status.
+  else if (state.bucketFilter === 'pending')        d = d.filter(r => rowStatus(r) === STATUS.PENDING);
+  else if (state.bucketFilter === 'selected')       d = d.filter(r => state.selectedIds.has(r.fileID));
 
   if (state.globalSearch.trim()) {
     const q = state.globalSearch.toLowerCase();
@@ -395,7 +435,18 @@ function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function renderStatusBadge(val, field) {
+function renderStatusBadge(val, field, row) {
+  if (field === 'migrate') {
+    // Show the canonical MigrationStatus so the user can see 'In Processing'
+    // and 'Failed' without needing a separate column.  Row's migrate flag
+    // (Yes/No) is only set for the terminal Migrated state.
+    const status = rowStatus(row);
+    if (status === STATUS.MIGRATED)       return '<span class="status-badge status-migrate-yes">Yes</span>';
+    if (status === STATUS.IN_PROCESSING)  return '<span class="status-badge status-in-processing">In Processing</span>';
+    if (status === STATUS.FAILED)         return '<span class="status-badge status-failed">Failed</span>';
+    return '<span class="status-no">No</span>';
+  }
+
   if (val === null || val === undefined || val === '') return '<span class="cell-empty">—</span>';
 
   if (field === 'extractionStatus') {
@@ -404,10 +455,6 @@ function renderStatusBadge(val, field) {
   }
   if (field === 'reviewRequired') {
     if (val === true || val === 'True') return '<span class="status-badge status-yes">Yes</span>';
-    return '<span class="status-no">No</span>';
-  }
-  if (field === 'migrate') {
-    if (val === true || val === 'True' || val === 'Yes') return '<span class="status-badge status-migrate-yes">Yes</span>';
     return '<span class="status-no">No</span>';
   }
   if (field === 'migrated') {
@@ -439,11 +486,11 @@ function renderCell(row, col) {
   }
 
   if (col.ft === 'bool' || col.f === 'reviewRequired' || col.f === 'migrated' || col.f === 'migrate') {
-    return renderStatusBadge(val, col.f);
+    return renderStatusBadge(val, col.f, row);
   }
 
   if (col.f === 'extractionStatus') {
-    return renderStatusBadge(val, col.f);
+    return renderStatusBadge(val, col.f, row);
   }
 
   if (!str) return '<span class="cell-empty">—</span>';
@@ -513,14 +560,33 @@ function renderTable() {
   } else {
     pageData.forEach((row, i) => {
       const globalIdx = start + i;
-      const isSelected = state.selectedIds.has(row.fileID);
-      const isMigrated = row.migrate === 'Yes';
-      const classes = [isSelected ? 'row-selected' : '', isMigrated ? 'row-migrated' : ''].filter(Boolean).join(' ');
+      const isSelected  = state.selectedIds.has(row.fileID);
+      const status      = rowStatus(row);
+      const isMigratedR = status === STATUS.MIGRATED;
+      const isInProc    = status === STATUS.IN_PROCESSING;
+      // Selection is blocked for BOTH terminal Migrated rows and in-flight
+      // In-Processing rows (business rule §15).
+      const lockedForSelection = isMigratedR || isInProc;
 
-      tbody += `<tr class="${classes}" data-id="${esc(row.fileID)}" ${isMigrated ? 'data-migrated="1"' : ''}>`;
+      const rowClasses = [
+        isSelected      ? 'row-selected'       : '',
+        isMigratedR     ? 'row-migrated'       : '',
+        isInProc        ? 'row-in-processing'  : '',
+      ].filter(Boolean).join(' ');
+
+      const cbTitle = isMigratedR ? 'Already migrated'
+                    : isInProc    ? 'Currently being migrated'
+                                  : '';
+      const cbDisabled = lockedForSelection ? `disabled title="${cbTitle}"` : '';
+      // data-migrated stays set only for terminal Migrated rows so the
+      // existing row-click guard keeps its exact semantics; a new
+      // data-locked flag covers the In-Processing case.
+      const dataFlags = (isMigratedR ? ' data-migrated="1"' : '')
+                      + (lockedForSelection ? ' data-locked="1"' : '');
+
+      tbody += `<tr class="${rowClasses}" data-id="${esc(row.fileID)}"${dataFlags}>`;
       tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:40px;min-width:40px;max-width:40px">${globalIdx + 1}</td>`;
-      const cbDisabled = isMigrated ? 'disabled title="Already migrated"' : '';
-      tbody += `<td class="col-cb col-frozen col-frozen-1 cell-cb" style="width:44px;min-width:44px;max-width:44px"${isMigrated ? ' title="Already migrated"' : ''}><input type="checkbox" class="row-check" data-id="${esc(row.fileID)}" ${isSelected ? 'checked' : ''} ${cbDisabled}></td>`;
+      tbody += `<td class="col-cb col-frozen col-frozen-1 cell-cb" style="width:44px;min-width:44px;max-width:44px"${cbTitle ? ` title="${cbTitle}"` : ''}><input type="checkbox" class="row-check" data-id="${esc(row.fileID)}" ${isSelected ? 'checked' : ''} ${cbDisabled}></td>`;
 
       visibleCols.forEach((col, idx) => {
         const w = state.colWidths[col.f] || col.w;
@@ -566,13 +632,13 @@ function getPageIds() {
   return state.filteredData.slice(start, start + state.pageSize).map(r => r.fileID);
 }
 
-// Only pending (not-yet-migrated) rows on the current page are eligible for
-// the master checkbox / row-click selection.
+// Only selectable rows (Pending or Failed — NOT Migrated or In Processing)
+// on the current page are eligible for the master checkbox / row-click.
 function getEligiblePageIds() {
   const start = (state.page - 1) * state.pageSize;
   return state.filteredData
     .slice(start, start + state.pageSize)
-    .filter(isPending)
+    .filter(isSelectable)
     .map(r => r.fileID);
 }
 
@@ -609,8 +675,10 @@ function attachTableEvents() {
   document.querySelectorAll('#table-root tbody tr[data-id]').forEach(tr => {
     tr.addEventListener('click', e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'A') return;
-      // Don't allow row-click to toggle selection on already-migrated rows
-      if (tr.dataset.migrated === '1') return;
+      // Don't allow row-click to toggle selection on rows locked for
+      // selection (Migrated OR In Processing).  Legacy data-migrated
+      // guard is kept below for maximum backwards compatibility.
+      if (tr.dataset.locked === '1' || tr.dataset.migrated === '1') return;
       const id = tr.dataset.id;
       if (state.selectedIds.has(id)) state.selectedIds.delete(id);
       else state.selectedIds.add(id);
@@ -634,12 +702,13 @@ function attachTableEvents() {
 
 /* ── Toolbar & footer update ────────────────────────────────────────────── */
 function updateToolbar() {
-  // Count only eligible (pending) documents among the currently selected set.
-  // Anything already-migrated slipping through is defensively ignored.
+  // Count only selectable (Pending / Failed) documents among the currently
+  // selected set.  Anything already-migrated or in-flight is defensively
+  // ignored — those states cannot be re-migrated (§15).
   let sel = 0;
   state.selectedIds.forEach(id => {
     const row = state.allData.find(r => r.fileID === id);
-    if (row && isPending(row)) sel++;
+    if (row && isSelectable(row)) sel++;
   });
 
   const btn = $('migrate-btn');
@@ -648,15 +717,17 @@ function updateToolbar() {
   btn.className = `action-migrate-btn${sel > 0 ? ' active' : ''}`;
 
   // Exclude button — enabled only when the selection includes at least one
-  // *pending* (not-yet-migrated) row.  Business rule: already-migrated
-  // documents cannot be excluded (protects the migration audit trail).
-  // The label shows the count that will actually be excluded on click.
+  // Pending row.  Business rule §19: already-migrated documents AND
+  // in-flight (In Processing) documents cannot be excluded.  Failed rows
+  // ARE excludable — they didn't move successfully and re-classifying them
+  // as excluded is a valid recovery workflow.
   const excludeBtn = $('exclude-btn');
   if (excludeBtn) {
     let excludable = 0;
     state.selectedIds.forEach(id => {
       const row = state.allData.find(r => r.fileID === id);
-      if (row && isPending(row)) excludable++;
+      // Exclude excludes Pending + Failed but not Migrated/In-Processing.
+      if (row && rowStatus(row) !== STATUS.MIGRATED && rowStatus(row) !== STATUS.IN_PROCESSING) excludable++;
     });
     excludeBtn.textContent = excludable > 0 ? `Exclude (${excludable})` : 'Exclude';
     excludeBtn.disabled = excludable === 0;
@@ -766,27 +837,51 @@ function renderActiveFilters() {
 
 /* ── Summary buckets ────────────────────────────────────────────────────── */
 function updateBuckets() {
-  // Total Documents = ACTIVE documents currently available for review.
-  // Excluded rows live in a separate table and are counted separately —
-  // they are NOT added into Total.  (Pending + Migrated == Total always.)
-  const active    = state.allData.length;
-  const migrated  = state.allData.reduce((n, r) => n + (isMigrated(r) ? 1 : 0), 0);
-  const pending   = active - migrated;
+  // KPI identity per manager spec:
+  //   A (Total) = B (Yet to be Migrated) + C (In Processing) + D (Migrated) + E (Excluded)
+  //
+  // Failed rows are still eligible for retry, so they roll up into
+  // "Yet to be Migrated" (B) — this preserves the A = B + C + D + E
+  // identity and keeps every document in exactly one KPI bucket.
+  let migrated = 0, inProcessing = 0, yetToBeMigrated = 0;
+  state.allData.forEach(r => {
+    switch (rowStatus(r)) {
+      case STATUS.MIGRATED:       migrated++;         break;
+      case STATUS.IN_PROCESSING:  inProcessing++;     break;
+      // Pending + Failed → eligible for migration → "Yet to be Migrated".
+      default:                    yetToBeMigrated++;  break;
+    }
+  });
   const excluded  = (typeof state.populationCounts.excluded === 'number')
                       ? state.populationCounts.excluded
                       : (state.excludedData.length || 0);
-  const total     = active;
-  // Selected count depends on which view the user is looking at.
-  const selected  = state.currentView === 'excluded'
-                      ? state.excludedSelectedIds.size
-                      : state.selectedIds.size;
+  // A = B + C + D + E  (Total Documents formula).
+  const total = yetToBeMigrated + inProcessing + migrated + excluded;
 
   const setVal = (id, v) => { const el = $(id); if (el) el.textContent = v.toLocaleString(); };
-  setVal('bucket-total',     total);
-  setVal('bucket-migrated',  migrated);
-  setVal('bucket-pending',   pending);
-  setVal('bucket-excluded',  excluded);
-  setVal('bucket-selected',  selected);
+  setVal('bucket-total',           total);
+  setVal('bucket-migrated',        migrated);
+  setVal('bucket-pending',         yetToBeMigrated);
+  setVal('bucket-in-processing',   inProcessing);
+  setVal('bucket-excluded',        excluded);
+
+  // Live formula tooltip on the Total bucket:
+  //   "B + C + D + E   <hover>  500 + 20 + 110 + 10 = 640"
+  // Values are dynamic — nothing is hardcoded.
+  const formulaEl = $('bucket-total-formula');
+  if (formulaEl) {
+    const parts = `${yetToBeMigrated.toLocaleString()} + ${inProcessing.toLocaleString()} + `
+                + `${migrated.toLocaleString()} + ${excluded.toLocaleString()}`;
+    formulaEl.setAttribute(
+      'title',
+      `B + C + D + E\n${parts} = ${total.toLocaleString()}`
+    );
+    formulaEl.setAttribute(
+      'aria-label',
+      `Total Documents formula: B (${yetToBeMigrated}) + C (${inProcessing}) + `
+      + `D (${migrated}) + E (${excluded}) = ${total}`
+    );
+  }
 
   // Active state — the Excluded bucket is "active" when the excluded view
   // is showing.  Everything else is driven by state.bucketFilter.
@@ -801,17 +896,9 @@ function updateBuckets() {
     b.setAttribute('aria-selected', isActive ? 'true' : 'false');
   });
 
-  // 'Selected' bucket only makes sense when something is selected
-  const selBtn = document.querySelector('.bucket-selected');
-  if (selBtn) {
-    selBtn.disabled = selected === 0 && state.bucketFilter !== 'selected';
-    // If user had 'selected' active but cleared all selections, fall back to 'all'
-    if (selected === 0 && state.bucketFilter === 'selected') {
-      state.bucketFilter = 'all';
-      selBtn.disabled = true;
-      applyFiltersAndSort();
-    }
-  }
+  // NOTE: A previous version had a 'Selected' bucket in this KPI row.
+  // Per manager spec the KPI row is now exactly A/B/C/D/E; the selected
+  // count lives only in the bottom action bar next to the Migrate button.
 }
 
 /* ── Main render ────────────────────────────────────────────────────────── */
@@ -1545,10 +1632,10 @@ function closeColPanel() {
 
 /* ── Migration modal ────────────────────────────────────────────────────── */
 function openMigrateModal() {
-  // Only pending, currently-selected docs are actually going to be migrated
+  // Only Pending / Failed (selectable) docs may actually be migrated.
   const eligible = [...state.selectedIds].filter(id => {
     const row = state.allData.find(r => r.fileID === id);
-    return row && isPending(row);
+    return row && isSelectable(row);
   });
   const n = eligible.length;
   if (n === 0) return;
@@ -1560,11 +1647,14 @@ function openMigrateModal() {
           <span class="modal-title">Confirm Migration</span>
         </div>
         <div class="modal-body">
-          <strong>${n}</strong> document${n !== 1 ? 's' : ''} will be migrated.
+          <strong>${n}</strong> document${n !== 1 ? 's' : ''} will be sent to Power Automate for migration.
           <div class="modal-note">
-            On success, each document's <b>Migrate</b> status will be set to <b>Yes</b>
-            and <b>MigratedDate</b> will be stamped with the completion time. Already-migrated
-            documents are skipped automatically.
+            The selected document${n !== 1 ? 's' : ''} will be marked
+            <b>In Processing</b> and handed off to Power Automate, which copies
+            them to the destination SharePoint. On confirmed success each row
+            becomes <b>Migrated</b> with its <b>MigratedDate</b> set to the actual
+            completion time. Any that fail remain flagged as <b>Failed</b> —
+            they are not marked Migrated.
           </div>
         </div>
         <div class="modal-footer">
@@ -1589,16 +1679,22 @@ function openMigrateModal() {
 
 /* ── Migration service ──────────────────────────────────────────────────────
  * Talks to POST /api/migrate which:
- *   1. Persists Migrate='Yes' + MigratedDate for the given FileIDs in Azure SQL
- *   2. Returns the authoritative timestamp actually written to the database
+ *   1. Persists MigrationStatus='In Processing' for eligible FileIDs (§4).
+ *   2. Triggers the Power Automate flow with the resulting batch.
+ *   3a. SYNC: applies per-doc success/failure and returns them.
+ *   3b. ASYNC: returns runId; results arrive later at /api/migrate/callback.
  *
- * Contract:
- *   input:  Array<fileID>  — ids to migrate
- *   output: Promise<{ succeeded: string[], failed: Array<{id, error}>, migratedAt: string }>
- *
- * Future SharePoint hook:
- *   Add a SharePoint call here BEFORE the /api/migrate POST (or replace
- *   the endpoint with one that fans out to SharePoint then updates the DB).
+ * Response contract (all fields always present):
+ *   {
+ *     mode:         'sync' | 'async' | 'unconfigured' | 'error' | 'noop',
+ *     runId:        string | null,
+ *     inProcessing: string[],                    // ids persisted to In Processing
+ *     migrated:     string[],                    // empty unless mode=sync
+ *     failed:       Array<{fileID, error}>,      // populated in sync + error
+ *     migratedAt:   string | null,
+ *     skipped:      string[],                    // ids not eligible for phase 1
+ *     error:        string | null
+ *   }
  * ────────────────────────────────────────────────────────────────────────── */
 const migrationService = {
   async migrate(ids) {
@@ -1614,9 +1710,14 @@ const migrationService = {
     }
     const json = await res.json();
     return {
-      succeeded:  Array.isArray(json.succeeded) ? json.succeeded : [...ids],
-      failed:     Array.isArray(json.failed)    ? json.failed    : [],
-      migratedAt: json.migratedAt || formatMigrationTimestamp(new Date()),
+      mode:         json.mode || 'async',
+      runId:        json.runId || null,
+      inProcessing: Array.isArray(json.inProcessing) ? json.inProcessing : [],
+      migrated:     Array.isArray(json.migrated)     ? json.migrated     : [],
+      failed:       Array.isArray(json.failed)       ? json.failed       : [],
+      migratedAt:   json.migratedAt || null,
+      skipped:      Array.isArray(json.skipped)      ? json.skipped      : [],
+      error:        json.error || null,
     };
   },
 };
@@ -1629,17 +1730,17 @@ function formatMigrationTimestamp(d) {
 }
 
 async function performMigration(ids) {
-  // Guard: never migrate already-migrated documents even if somehow selected.
+  // Guard: only Pending/Failed rows may be sent (§15).
   const eligibleIds = [...ids].filter(id => {
     const row = state.allData.find(r => r.fileID === id);
-    return row && isPending(row);
+    return row && isSelectable(row);
   });
   if (!eligibleIds.length) {
     showToast('No eligible documents to migrate.');
     return;
   }
 
-  // Disable the button while the async call is in flight
+  // Disable the button while the call is in flight
   const btn = $('migrate-btn');
   const oldTxt = btn.textContent;
   btn.disabled = true;
@@ -1655,35 +1756,68 @@ async function performMigration(ids) {
     return;
   }
 
-  const succeededSet = new Set(result.succeeded);
-  // Ensure server-provided timestamp is displayed in the same zero-padded
-  // US format as ingested rows.  Falls back to a locally-formatted "now"
-  // if the server didn't include a value.
-  const migratedAt   = toUsDateTime(result.migratedAt) || formatMigrationTimestamp(new Date());
-
-  // Update ONLY the successful documents (fully isolated to the selected set)
+  // ── Phase 1 (immediate): flip client-side rows to 'In Processing' ──
+  // The server has already persisted this transition; we mirror it in
+  // state.allData so the UI is honest without needing a refetch (§4).
+  const inProcessingSet = new Set(result.inProcessing);
   state.allData.forEach(r => {
-    if (succeededSet.has(r.fileID)) {
-      r.migrate = 'Yes';
-      r.migratedDate = migratedAt;
+    if (inProcessingSet.has(r.fileID)) {
+      r.migrationStatus = STATUS.IN_PROCESSING;
+      // migrate flag NOT set to Yes — MigratedDate stays empty (§14).
     }
-    // Failed ones: keep migrate='No' and migratedDate=''
-    // (Contract already ensures this — no-op here.)
   });
 
-  // Clear selection for migrated docs (leave any failed ones selected so the
-  // user can retry). For the mock, failed is always empty → clears all.
-  succeededSet.forEach(id => state.selectedIds.delete(id));
+  // Documents that moved to In Processing must not stay in the selection
+  // (§13: they leave Pending immediately) and cannot be re-selected (§15).
+  inProcessingSet.forEach(id => state.selectedIds.delete(id));
+
+  // Phase 1 user feedback (§16).
+  const nIP = result.inProcessing.length;
+  if (nIP > 0) {
+    showToast(`${nIP} file${nIP !== 1 ? 's' : ''} moved to In Processing.`);
+  }
+
+  // ── Phase 2 outcome — depends on the flow mode ──
+  const migratedSet = new Set(result.migrated);
+  const failedMap   = new Map(result.failed.map(f => [f.fileID, f.error]));
+  const migratedAt  = toUsDateTime(result.migratedAt) || formatMigrationTimestamp(new Date());
+
+  state.allData.forEach(r => {
+    if (migratedSet.has(r.fileID)) {
+      r.migrationStatus = STATUS.MIGRATED;
+      r.migrate         = 'Yes';
+      r.migratedDate    = migratedAt;
+    } else if (failedMap.has(r.fileID)) {
+      r.migrationStatus = STATUS.FAILED;
+      // Explicitly do NOT set r.migrate='Yes' and do NOT set migratedDate (§10).
+    }
+    // Anything still in inProcessingSet that isn't in migrated/failed sets
+    // stays 'In Processing' — the async callback will resolve it later.
+  });
 
   applyFiltersAndSort();
   renderAll();
 
-  const n = result.succeeded.length;
-  const f = result.failed.length;
-  if (f > 0) {
-    showToast(`${n} migrated successfully, ${f} failed.`);
-  } else {
-    showToast(`${n} document${n !== 1 ? 's' : ''} migrated successfully.`);
+  // Phase 2 user feedback (§16, §17).
+  if (result.mode === 'sync') {
+    const nOk = result.migrated.length;
+    const nBad = result.failed.length;
+    if (nBad > 0 && nOk > 0) {
+      showToast(`${nOk} file${nOk !== 1 ? 's' : ''} migrated successfully. ${nBad} failed.`);
+    } else if (nOk > 0) {
+      showToast(`${nOk} file${nOk !== 1 ? 's' : ''} migrated successfully.`);
+    } else if (nBad > 0) {
+      showToast(`Migration failed for ${nBad} file${nBad !== 1 ? 's' : ''}.`);
+    }
+  } else if (result.mode === 'error') {
+    // Server converted the trigger error into per-doc failures — surface that.
+    const nBad = result.failed.length;
+    showToast(`Migration could not start${result.error ? `: ${result.error}` : ''}. ${nBad} file${nBad !== 1 ? 's' : ''} marked as Failed.`);
+  } else if (result.mode === 'async' || result.mode === 'unconfigured') {
+    // Rows remain 'In Processing' pending the Power Automate callback.
+    // Toast already shown above for Phase 1 — nothing else to show.
+  } else if (result.mode === 'noop') {
+    showToast('No eligible documents to migrate.');
   }
 }
 
@@ -2109,8 +2243,9 @@ async function performRestoration(ids) {
         const { excludedDate, excludedBy, ...rest } = r;
         return normaliseDatesInRow({
           ...rest,
-          migrate:      (rest.migrate === 'Yes' || rest.migrate === true) ? 'Yes' : 'No',
-          migratedDate: rest.migratedDate || '',
+          migrate:         (rest.migrate === 'Yes' || rest.migrate === true) ? 'Yes' : 'No',
+          migratedDate:    rest.migratedDate || '',
+          migrationStatus: rest.migrationStatus || (rest.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
         });
       });
 
@@ -2203,18 +2338,28 @@ function initSourceScreen() {
 
       // Capture server-authoritative population counts so the Total and
       // Excluded buckets reflect the *entire* population (active + excluded)
-      // even before the user opens the Excluded view.
+      // even before the user opens the Excluded view.  Per-status counts
+      // (pending / in_processing / migrated / failed) are also captured for
+      // resilience on partial reloads.
       if (json.counts && typeof json.counts === 'object') {
         state.populationCounts = {
-          active:   Number(json.counts.active)   || state.sourceData.length,
-          excluded: Number(json.counts.excluded) || 0,
-          total:    Number(json.counts.total)    || state.sourceData.length,
+          active:        Number(json.counts.active)        || state.sourceData.length,
+          excluded:      Number(json.counts.excluded)      || 0,
+          total:         Number(json.counts.total)         || state.sourceData.length,
+          pending:       Number(json.counts.pending)       || 0,
+          in_processing: Number(json.counts.in_processing) || 0,
+          migrated:      Number(json.counts.migrated)      || 0,
+          failed:        Number(json.counts.failed)        || 0,
         };
       } else {
         state.populationCounts = {
-          active:   state.sourceData.length,
-          excluded: 0,
-          total:    state.sourceData.length,
+          active:        state.sourceData.length,
+          excluded:      0,
+          total:         state.sourceData.length,
+          pending:       0,
+          in_processing: 0,
+          migrated:      0,
+          failed:        0,
         };
       }
 
@@ -2238,8 +2383,11 @@ function initSourceScreen() {
     state.allData = state.sourceData.map(r => {
       const row = {
         ...r,
-        migrate:      (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
-        migratedDate: r.migratedDate || '',
+        migrate:         (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
+        migratedDate:    r.migratedDate || '',
+        // migrationStatus is authoritative for row state (§5).  Fall back
+        // to Pending if the server didn't populate it (e.g. very old row).
+        migrationStatus: r.migrationStatus || (r.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
       };
       // Normalise every date column to zero-padded US format (MM/DD/YYYY)
       // for consistent display.  Filter/sort still work because parseDate()

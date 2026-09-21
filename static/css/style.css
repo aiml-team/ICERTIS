@@ -52,7 +52,8 @@ html, body {
 .buckets {
   flex-shrink: 0;
   display: grid;
-  /* 5 equal columns: Total | Migrated | Pending | Excluded | Selected */
+  /* 5 equal columns per manager KPI spec: A | B | C | D | E
+     A = Total | B = Yet to be Migrated | C = In Processing | D = Migrated | E = Excluded */
   grid-template-columns: repeat(5, 1fr);
   align-items: stretch;
   gap: 12px;
@@ -62,14 +63,14 @@ html, body {
 }
 
 .bucket {
-  /* Grid handles sizing — each cell is exactly 1fr wide (all four identical). */
+  /* Grid handles sizing — each cell is exactly 1fr wide (all five identical). */
   width: 100%;
   min-width: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 8px 14px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-left: 3px solid #94a3b8;
@@ -80,6 +81,34 @@ html, body {
   transition: background 0.12s, border-color 0.12s, box-shadow 0.12s, transform 0.05s;
   user-select: none;
   text-align: left;
+}
+
+/* Letter tag (A/B/C/D/E) — subtle rounded chip on the left of each KPI. */
+.bucket-tag {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #475569;
+  background: #eef2f7;
+  border: 1px solid #dbe2ec;
+  border-radius: 5px;
+  letter-spacing: 0.4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Body wrapper — stacks label / value / (optional formula). */
+.bucket-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .bucket:hover:not(:disabled) {
@@ -110,12 +139,49 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Total-only: value + formula stacked on the right of the body so the
+   KPI stays the same height as the other four buckets. */
+.bucket-total-right {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  line-height: 1;
+}
+
+/* Small helper caption showing "B + C + D + E" under the Total value.
+   Hoverable — the title attribute shows the actual live calculation.
+   Kept intentionally quiet so the main number stays dominant. */
+.bucket-formula {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  color: #64748b;
+  cursor: help;
+  text-align: right;
+  line-height: 1.1;
+  white-space: nowrap;
+  border-bottom: 1px dotted #cbd5e1;
+  padding-bottom: 1px;
+}
+.bucket-formula:hover,
+.bucket-formula:focus {
+  color: #0f6cbd;
+  border-bottom-color: #0f6cbd;
+  outline: none;
+}
+
+
 /* Semantic accents (subtle) */
 .bucket-total    { border-left-color: #64748b; }
 .bucket-migrated { border-left-color: #059669; }
 .bucket-migrated .bucket-value { color: #065f46; }
 .bucket-pending  { border-left-color: #d97706; }
 .bucket-pending  .bucket-value { color: #92400e; }
+.bucket-in-processing { border-left-color: #7c3aed; }
+.bucket-in-processing .bucket-value { color: #5b21b6; }
 .bucket-excluded { border-left-color: #b42318; }
 .bucket-excluded .bucket-value { color: #971b12; }
 .bucket-selected { border-left-color: #0f6cbd; }
@@ -137,6 +203,9 @@ html, body {
 
 .bucket-pending.active  { background: #fffbeb; border-color: #fcd34d; box-shadow: inset 0 0 0 1px #fcd34d; }
 .bucket-pending.active  .bucket-label { color: #92400e; }
+
+.bucket-in-processing.active { background: #f5f3ff; border-color: #c4b5fd; box-shadow: inset 0 0 0 1px #c4b5fd; }
+.bucket-in-processing.active .bucket-label { color: #5b21b6; }
 
 .bucket-excluded.active { background: #fef2f2; border-color: #fca5a5; box-shadow: inset 0 0 0 1px #fca5a5; }
 .bucket-excluded.active .bucket-label { color: #971b12; }
@@ -1666,6 +1735,33 @@ thead .cell-rn {
 
 /* ── Migrate-yes badge (green) ─────────────────────────────────────────── */
 .status-migrate-yes { background: #d1fae5; color: #065f46; }
+
+/* ── Migration-status badges (in-processing + failed) ──────────────────── */
+.status-in-processing {
+  background: #ede9fe;
+  color: #5b21b6;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.status-in-processing::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7c3aed;
+  animation: mig-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mig-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(1.3); }
+}
+.status-failed { background: #fee2e2; color: #991b1b; }
+
+/* Row shading for In Processing rows — subtle violet tint so the user can
+   spot in-flight rows even when the Migrate column is scrolled out. */
+tr.row-in-processing td { background: #faf5ff !important; }
+tr.row-in-processing:hover td { background: #f3ecfe !important; }
 
 /* ── Folder browser (toolbar button + dropdown + breadcrumb) ──────────── */
 #folder-btn {

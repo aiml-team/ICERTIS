@@ -78,6 +78,7 @@ BEGIN
         Migrate                NVARCHAR(8)   NOT NULL CONSTRAINT DF_{table}_Migrate DEFAULT ('No'),
         Migrated               NVARCHAR(16)  NULL,
         MigratedDate           DATETIME2     NULL,
+        MigrationStatus        NVARCHAR(32)  NOT NULL CONSTRAINT DF_{table}_MigrationStatus DEFAULT ('Pending'),
         Excluded               NVARCHAR(8)   NOT NULL CONSTRAINT DF_{table}_Excluded DEFAULT ('No')
     );
 END
@@ -95,6 +96,53 @@ BEGIN
     ALTER TABLE dbo.[{table}]
       ADD Excluded NVARCHAR(8) NOT NULL
       CONSTRAINT DF_{table}_Excluded DEFAULT ('No') WITH VALUES;
+END
+"""
+
+# Idempotent ALTER: add MigrationStatus column (Pending / In Processing /
+# Migrated / Failed).  Backfills existing rows so state is coherent with
+# the legacy Migrate='Yes' column that still exists as an audit flag.
+#
+# Backfill rules:
+#   Migrate = 'Yes'  → MigrationStatus = 'Migrated'
+#   otherwise        → MigrationStatus = 'Pending'
+# NB: the ALTER + UPDATE must be in SEPARATE batches — SQL Server compiles
+# a batch before it runs, so referencing the new column in the same batch
+# as its ALTER raises "Invalid column name".  We use EXEC(N'…') to defer
+# the UPDATE compilation to runtime (post-ALTER).
+_ADD_MIGRATION_STATUS_COLUMN_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE Name = N'MigrationStatus' AND Object_ID = Object_ID(N'dbo.[{table}]')
+)
+BEGIN
+    ALTER TABLE dbo.[{table}]
+      ADD MigrationStatus NVARCHAR(32) NOT NULL
+      CONSTRAINT DF_{table}_MigrationStatus DEFAULT ('Pending') WITH VALUES;
+
+    EXEC(N'UPDATE dbo.[{table}]
+             SET MigrationStatus = CASE
+               WHEN ISNULL(Migrate, ''No'') = ''Yes'' THEN ''Migrated''
+               ELSE ''Pending''
+             END');
+END
+"""
+
+_ADD_MIGRATION_STATUS_COLUMN_EX_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE Name = N'MigrationStatus' AND Object_ID = Object_ID(N'dbo.[{ex_table}]')
+)
+BEGIN
+    ALTER TABLE dbo.[{ex_table}]
+      ADD MigrationStatus NVARCHAR(32) NOT NULL
+      CONSTRAINT DF_{ex_table}_MigrationStatus DEFAULT ('Pending') WITH VALUES;
+
+    EXEC(N'UPDATE dbo.[{ex_table}]
+             SET MigrationStatus = CASE
+               WHEN ISNULL(Migrate, ''No'') = ''Yes'' THEN ''Migrated''
+               ELSE ''Pending''
+             END');
 END
 """
 
@@ -140,6 +188,7 @@ BEGIN
         Migrate                NVARCHAR(8)   NOT NULL CONSTRAINT DF_{ex_table}_Migrate DEFAULT ('No'),
         Migrated               NVARCHAR(16)  NULL,
         MigratedDate           DATETIME2     NULL,
+        MigrationStatus        NVARCHAR(32)  NOT NULL CONSTRAINT DF_{ex_table}_MigrationStatus DEFAULT ('Pending'),
         ExcludedDate           DATETIME2     NOT NULL CONSTRAINT DF_{ex_table}_ExcludedDate DEFAULT SYSUTCDATETIME(),
         ExcludedBy             NVARCHAR(256) NULL
     );
@@ -176,6 +225,25 @@ def ensure_excluded_column() -> None:
     with get_connection() as cn:
         cur = cn.cursor()
         cur.execute(_ADD_EXCLUDED_COLUMN_DDL.format(table=settings.CONTRACT_TABLE))
+        cn.commit()
+
+
+def ensure_migration_status_column() -> None:
+    """Idempotent: adds the MigrationStatus column to both active and
+    excluded tables if they pre-date the feature.  Backfills existing
+    rows on first run so state is coherent (Yes → Migrated, else Pending).
+
+    Values used by the app:
+        'Pending'        — eligible for migration selection
+        'In Processing'  — user confirmed, Power Automate call in flight
+        'Migrated'       — Power Automate reported success + timestamp set
+        'Failed'         — Power Automate reported failure (row stays out
+                           of Migrated bucket; Migrate flag NOT set to Yes)
+    """
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(_ADD_MIGRATION_STATUS_COLUMN_DDL.format(table=settings.CONTRACT_TABLE))
+        cur.execute(_ADD_MIGRATION_STATUS_COLUMN_EX_DDL.format(ex_table=excluded_table_name()))
         cn.commit()
 
 

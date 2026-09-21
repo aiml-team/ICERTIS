@@ -28,6 +28,25 @@ class Settings:
     # ── Application ──────────────────────────────────────────────────────
     CONTRACT_TABLE: str = os.getenv("CONTRACT_TABLE", "ContractInventory")
 
+    # ── Power Automate migration flow ────────────────────────────────────
+    # The URL is the HTTP trigger of a Power Automate cloud flow that
+    # copies a batch of documents from the source SharePoint site into
+    # the destination.  If unset, the /api/migrate endpoint still moves
+    # rows to 'In Processing' but does NOT auto-complete them — a later
+    # webhook / callback can post per-doc results to /api/migrate/callback.
+    #
+    # POWER_AUTOMATE_URL      full trigger URL (may include signature/SAS)
+    # POWER_AUTOMATE_TIMEOUT  request timeout in seconds (default 60)
+    # POWER_AUTOMATE_SYNC     "1" if the flow returns per-doc results in
+    #                         the response body (synchronous); "0" if it
+    #                         only starts a long-running job (default 0)
+    # POWER_AUTOMATE_API_KEY  optional bearer/API key (sent as
+    #                         "Authorization: Bearer <key>" when present)
+    POWER_AUTOMATE_URL:     str  = os.getenv("POWER_AUTOMATE_URL", "")
+    POWER_AUTOMATE_TIMEOUT: int  = int(os.getenv("POWER_AUTOMATE_TIMEOUT", "60"))
+    POWER_AUTOMATE_SYNC:    bool = os.getenv("POWER_AUTOMATE_SYNC", "0") == "1"
+    POWER_AUTOMATE_API_KEY: str  = os.getenv("POWER_AUTOMATE_API_KEY", "")
+
     @property
     def odbc_connection_string(self) -> str:
         return (

@@ -48,30 +48,53 @@
   <!-- ── Screen 3: Manual Review ─────────────────────────────────────── -->
   <div class="screen screen-review" id="screen-review" style="display:none">
 
-    <!-- Summary buckets (clickable status filters).
-         Order: Total | Migrated | Pending | Excluded | Selected.
-         Total = active + excluded (full document population).
-         Clicking Excluded switches to the Excluded view. -->
-    <div class="buckets" id="buckets" role="tablist" aria-label="Migration status filters">
-      <button type="button" class="bucket bucket-total active" data-bucket="all" role="tab" aria-selected="true" title="Show all active documents">
-        <span class="bucket-label">Total Documents</span>
-        <span class="bucket-value" id="bucket-total">0</span>
+    <!-- Summary KPIs.  Order per manager spec:
+           A — Total Documents        (= B + C + D + E)
+           B — Yet to be Migrated
+           C — In Processing
+           D — Migrated
+           E — Excluded
+         Selected is deliberately NOT in this row — it lives in the bottom
+         action bar next to the Migrate button. -->
+    <div class="buckets" id="buckets" role="tablist" aria-label="Migration status KPIs">
+      <button type="button" class="bucket bucket-total active" data-bucket="all" role="tab" aria-selected="true" title="Show all active documents (includes excluded on click)">
+        <span class="bucket-tag" aria-hidden="true">A</span>
+        <span class="bucket-body">
+          <span class="bucket-label">Total Documents</span>
+          <span class="bucket-total-right">
+            <span class="bucket-value" id="bucket-total">0</span>
+            <span class="bucket-formula" id="bucket-total-formula" tabindex="0"
+                  title="B + C + D + E">B + C + D + E</span>
+          </span>
+        </span>
       </button>
-      <button type="button" class="bucket bucket-migrated" data-bucket="migrated" role="tab" aria-selected="false" title="Show only migrated documents">
-        <span class="bucket-label">Migrated</span>
-        <span class="bucket-value" id="bucket-migrated">0</span>
+      <button type="button" class="bucket bucket-pending" data-bucket="pending" role="tab" aria-selected="false" title="Documents that have not started migration and are still eligible">
+        <span class="bucket-tag" aria-hidden="true">B</span>
+        <span class="bucket-body">
+          <span class="bucket-label">Yet to be Migrated</span>
+          <span class="bucket-value" id="bucket-pending">0</span>
+        </span>
       </button>
-      <button type="button" class="bucket bucket-pending" data-bucket="pending" role="tab" aria-selected="false" title="Show only pending documents">
-        <span class="bucket-label">Pending</span>
-        <span class="bucket-value" id="bucket-pending">0</span>
+      <button type="button" class="bucket bucket-in-processing" data-bucket="in_processing" role="tab" aria-selected="false" title="Documents currently being migrated by Power Automate">
+        <span class="bucket-tag" aria-hidden="true">C</span>
+        <span class="bucket-body">
+          <span class="bucket-label">In Processing</span>
+          <span class="bucket-value" id="bucket-in-processing">0</span>
+        </span>
       </button>
-      <button type="button" class="bucket bucket-selected" data-bucket="selected" role="tab" aria-selected="false" title="Show only currently selected documents" disabled>
-        <span class="bucket-label">Selected</span>
-        <span class="bucket-value" id="bucket-selected">0</span>
+      <button type="button" class="bucket bucket-migrated" data-bucket="migrated" role="tab" aria-selected="false" title="Documents successfully migrated">
+        <span class="bucket-tag" aria-hidden="true">D</span>
+        <span class="bucket-body">
+          <span class="bucket-label">Migrated</span>
+          <span class="bucket-value" id="bucket-migrated">0</span>
+        </span>
       </button>
       <button type="button" class="bucket bucket-excluded" data-bucket="excluded" role="tab" aria-selected="false" title="View recoverable excluded documents">
-        <span class="bucket-label">Excluded</span>
-        <span class="bucket-value" id="bucket-excluded">0</span>
+        <span class="bucket-tag" aria-hidden="true">E</span>
+        <span class="bucket-body">
+          <span class="bucket-label">Excluded</span>
+          <span class="bucket-value" id="bucket-excluded">0</span>
+        </span>
       </button>
     </div>
 
