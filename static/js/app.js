@@ -2300,19 +2300,51 @@ function showScreen(name) {
 }
 
 /* ── Source Data screen ────────────────────────────────────────────────────
- * One page, three inline actions:
- *   [ Start ]      ✓ N documents found      [ Next → ]
- * Start fetches from /api/contracts; Next uses the already-fetched dataset
- * (no re-fetch) and enters the Manual Review page.
+ * Single action button.  Click Start → fetch documents → on success go
+ * directly to the Manual Review page (no intermediate "N documents found"
+ * step, no Next button).  All existing DB fetch logic is preserved; only
+ * the navigation gate between fetch success and Manual Review is removed.
  * ─────────────────────────────────────────────────────────────────────── */
+function enterReviewScreen() {
+  // Use the data already retrieved by Start — do NOT re-fetch.
+  state.allData = state.sourceData.map(r => {
+    const row = {
+      ...r,
+      migrate:         (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
+      migratedDate:    r.migratedDate || '',
+      // migrationStatus is authoritative for row state.  Fall back to
+      // Pending if the server didn't populate it (e.g. very old row).
+      migrationStatus: r.migrationStatus || (r.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
+    };
+    // Normalise every date column to zero-padded US format (MM/DD/YYYY)
+    // for consistent display.  Filter/sort still work because parseDate()
+    // accepts both padded and non-padded variants.
+    return normaliseDatesInRow(row);
+  });
+
+  state.columnFilters = {};
+  state.globalSearch  = '';
+  state.sortCol       = null;
+  state.sortDir       = null;
+  state.selectedIds.clear();
+  state.bucketFilter  = 'all';
+  state.folderPath    = [];
+  state.page = 1;
+
+  // Build the folder tree ONCE from state.allData; exclude/restore keep
+  // it in sync by calling rebuildFolderTree() after mutating allData.
+  rebuildFolderTree();
+
+  applyFiltersAndSort();
+  showScreen('review');
+  $('table-root').closest('.table-container').style.display = '';
+  renderAll();
+}
+
 function initSourceScreen() {
   const startBtn  = $('source-start-btn');
   const labelEl   = startBtn.querySelector('.source-start-label');
   const errorEl   = $('source-error');
-  const resultEl  = $('source-result');
-  const countEl   = $('source-result-count');
-  const rLabelEl  = $('source-result-label');
-  const nextBtn   = $('source-next-btn');
 
   startBtn.addEventListener('click', async () => {
     // Guard against duplicate requests
@@ -2321,9 +2353,6 @@ function initSourceScreen() {
     startBtn.classList.add('is-loading');
     labelEl.textContent = 'Fetching documents…';
     errorEl.style.display = 'none';
-    // Hide any prior result while a new fetch is running
-    resultEl.hidden = true;
-    nextBtn.hidden = true;
 
     try {
       const res = await fetch('/api/contracts', { cache: 'no-store' });
@@ -2336,11 +2365,8 @@ function initSourceScreen() {
       state.sourceData  = Array.isArray(json.data) ? json.data : [];
       state.sourceCount = typeof json.total === 'number' ? json.total : state.sourceData.length;
 
-      // Capture server-authoritative population counts so the Total and
-      // Excluded buckets reflect the *entire* population (active + excluded)
-      // even before the user opens the Excluded view.  Per-status counts
-      // (pending / in_processing / migrated / failed) are also captured for
-      // resilience on partial reloads.
+      // Capture server-authoritative population counts so the Manual Review
+      // KPI buckets reflect the *entire* population (active + excluded).
       if (json.counts && typeof json.counts === 'object') {
         state.populationCounts = {
           active:        Number(json.counts.active)        || state.sourceData.length,
@@ -2363,11 +2389,10 @@ function initSourceScreen() {
         };
       }
 
-      countEl.textContent = state.sourceCount.toLocaleString();
-      rLabelEl.textContent =
-        state.sourceCount === 1 ? 'document found' : 'documents found';
-      resultEl.hidden = false;
-      nextBtn.hidden = false;
+      // Success → go straight to Manual Review.  The button label is reset
+      // by the finally block below so a future re-entry (via reload) starts
+      // clean.  On failure we stay on this page and let the user retry.
+      enterReviewScreen();
     } catch (err) {
       errorEl.textContent = `Unable to load source documents: ${err.message}`;
       errorEl.style.display = '';
@@ -2376,42 +2401,6 @@ function initSourceScreen() {
       startBtn.classList.remove('is-loading');
       labelEl.textContent = 'Start';
     }
-  });
-
-  nextBtn.addEventListener('click', () => {
-    // Use the data already retrieved by Start — do NOT re-fetch.
-    state.allData = state.sourceData.map(r => {
-      const row = {
-        ...r,
-        migrate:         (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
-        migratedDate:    r.migratedDate || '',
-        // migrationStatus is authoritative for row state (§5).  Fall back
-        // to Pending if the server didn't populate it (e.g. very old row).
-        migrationStatus: r.migrationStatus || (r.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
-      };
-      // Normalise every date column to zero-padded US format (MM/DD/YYYY)
-      // for consistent display.  Filter/sort still work because parseDate()
-      // accepts both padded and non-padded variants.
-      return normaliseDatesInRow(row);
-    });
-
-    state.columnFilters = {};
-    state.globalSearch  = '';
-    state.sortCol       = null;
-    state.sortDir       = null;
-    state.selectedIds.clear();
-    state.bucketFilter  = 'all';
-    state.folderPath    = [];
-    state.page = 1;
-
-    // Build the folder tree ONCE from state.allData; exclude/restore keep
-    // it in sync by calling rebuildFolderTree() after mutating allData.
-    rebuildFolderTree();
-
-    applyFiltersAndSort();
-    showScreen('review');
-    $('table-root').closest('.table-container').style.display = '';
-    renderAll();
   });
 }
 

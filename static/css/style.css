@@ -1652,86 +1652,21 @@ thead .cell-rn {
 
 @keyframes source-spin { to { transform: rotate(360deg); } }
 
-/* ── Source Data action row (Start · result · Next) ────────────────────── */
+/* ── Source Data action row ────────────────────────────────────────────
+ * Start is the ONLY control on this page.  On click, it enters a loading
+ * state ("Fetching documents…") and — on success — the app navigates
+ * directly to Manual Review.  No result badge, no Next button.  Centered
+ * within the source card. */
 .source-actions {
   margin-top: 18px;
   display: flex;
   align-items: center;
-  gap: 18px;
-  flex-wrap: wrap;
   justify-content: center;
   width: 100%;
 }
 
 /* Keep Start's own top margin from the pre-existing rule; the row handles spacing */
 .source-actions .source-start-btn { margin-top: 0; }
-
-/* Inline result badge — subtle success indicator, never dashboard-sized */
-.source-result {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: #ecfdf5;
-  border: 1px solid #a7f3d0;
-  border-radius: 20px;
-  color: #065f46;
-  font-size: 13px;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.source-check {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #059669;
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  flex-shrink: 0;
-}
-
-.source-result-text {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-}
-
-.source-result-count {
-  font-weight: 700;
-  color: #064e3b;
-}
-
-.source-result-label {
-  color: #065f46;
-  font-weight: 500;
-}
-
-/* Next button — visually secondary to Start so Start doesn't lose focus */
-.source-next-btn {
-  height: 42px;
-  min-width: 120px;
-  padding: 0 24px;
-  background: #fff;
-  border: 1px solid #0a57a0;
-  border-radius: 6px;
-  color: #0a57a0;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s, box-shadow 0.15s;
-  font-family: inherit;
-}
-
-.source-next-btn:hover {
-  background: #eff6ff;
-  box-shadow: 0 2px 8px rgba(15,108,189,0.18);
-}
 
 /* ── Migrate-yes badge (green) ─────────────────────────────────────────── */
 .status-migrate-yes { background: #d1fae5; color: #065f46; }
