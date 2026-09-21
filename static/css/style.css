@@ -1,0 +1,1668 @@
+/* ── Reset & base ──────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 12px;
+  background: #f0f2f5;
+  color: #1a1a2e;
+  overflow: hidden;
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────── */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+/* ── Header ────────────────────────────────────────────────────────────── */
+.app-header {
+  flex-shrink: 0;
+  background: #fff;
+  padding: 0 28px;
+  display: flex;
+  align-items: center;
+  height: 60px;
+  border-bottom: 3px solid #0f6cbd;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.08);
+  z-index: 30;
+}
+
+.app-brand {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.app-title {
+  font-size: 19px;
+  font-weight: 700;
+  color: #0d1f35;
+  letter-spacing: -0.2px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+/* ── Summary buckets ───────────────────────────────────────────────────── */
+.buckets {
+  flex-shrink: 0;
+  display: grid;
+  /* 5 equal columns: Total | Migrated | Pending | Excluded | Selected */
+  grid-template-columns: repeat(5, 1fr);
+  align-items: stretch;
+  gap: 12px;
+  padding: 10px 24px;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.bucket {
+  /* Grid handles sizing — each cell is exactly 1fr wide (all four identical). */
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #94a3b8;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  color: #1f2937;
+  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s, transform 0.05s;
+  user-select: none;
+  text-align: left;
+}
+
+.bucket:hover:not(:disabled) {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.bucket:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.bucket-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.bucket-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0d1f35;
+  line-height: 1;
+  letter-spacing: -0.3px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Semantic accents (subtle) */
+.bucket-total    { border-left-color: #64748b; }
+.bucket-migrated { border-left-color: #059669; }
+.bucket-migrated .bucket-value { color: #065f46; }
+.bucket-pending  { border-left-color: #d97706; }
+.bucket-pending  .bucket-value { color: #92400e; }
+.bucket-excluded { border-left-color: #b42318; }
+.bucket-excluded .bucket-value { color: #971b12; }
+.bucket-selected { border-left-color: #0f6cbd; }
+.bucket-selected .bucket-value { color: #0f6cbd; }
+
+/* Active (selected filter) state */
+.bucket.active {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  box-shadow: inset 0 0 0 1px #93c5fd;
+}
+.bucket.active .bucket-label { color: #1d4ed8; }
+
+.bucket-total.active    { background: #f1f5f9; border-color: #94a3b8; box-shadow: inset 0 0 0 1px #94a3b8; }
+.bucket-total.active .bucket-label { color: #1f2937; }
+
+.bucket-migrated.active { background: #ecfdf5; border-color: #6ee7b7; box-shadow: inset 0 0 0 1px #6ee7b7; }
+.bucket-migrated.active .bucket-label { color: #047857; }
+
+.bucket-pending.active  { background: #fffbeb; border-color: #fcd34d; box-shadow: inset 0 0 0 1px #fcd34d; }
+.bucket-pending.active  .bucket-label { color: #92400e; }
+
+.bucket-excluded.active { background: #fef2f2; border-color: #fca5a5; box-shadow: inset 0 0 0 1px #fca5a5; }
+.bucket-excluded.active .bucket-label { color: #971b12; }
+
+.bucket-selected.active { background: #eff6ff; border-color: #93c5fd; box-shadow: inset 0 0 0 1px #93c5fd; }
+.bucket-selected.active .bucket-label { color: #1d4ed8; }
+
+.bucket:focus-visible {
+  outline: 2px solid #0f6cbd;
+  outline-offset: 2px;
+}
+
+/* ── Toolbar ───────────────────────────────────────────────────────────── */
+.toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  background: #f4f6f9;
+  border-bottom: 1px solid #dde1e7;
+  padding: 0 24px;
+  height: 48px;
+  gap: 0;
+}
+
+/* Left cluster — data-review controls */
+.tb-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-right: auto;   /* pushes .tb-right to the far right of the toolbar */
+}
+
+/* Right cluster — export & other row-scoped actions */
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tb-export-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tb-export-icon {
+  font-size: 13px;
+  line-height: 1;
+  color: #0f6cbd;
+}
+
+/* Search input wrapper */
+.tb-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.tb-search-icon {
+  position: absolute;
+  left: 9px;
+  color: #9ca3af;
+  font-size: 14px;
+  pointer-events: none;
+  line-height: 1;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.tb-search input {
+  height: 30px;
+  padding: 0 28px 0 30px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 12px;
+  width: 262px;
+  outline: none;
+  background: #fff;
+  color: #1f2937;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.tb-search input::placeholder { color: #9ca3af; }
+
+.tb-search input:focus {
+  border-color: #0f6cbd;
+  box-shadow: 0 0 0 3px rgba(15,108,189,0.10);
+}
+
+.tb-search-clear {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #9ca3af;
+  font-size: 11px;
+  padding: 2px 3px;
+  line-height: 1;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+}
+
+.tb-search-clear:hover { color: #374151; background: #e5e7eb; }
+
+/* Secondary toolbar buttons */
+.tb-btn {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  background: #fff;
+  font-size: 11.5px;
+  cursor: pointer;
+  color: #374151;
+  white-space: nowrap;
+  line-height: 1;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  font-family: inherit;
+}
+
+.tb-btn:hover:not(:disabled) {
+  background: #edf0f4;
+  border-color: #b3bac5;
+  color: #111827;
+}
+
+.tb-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+/* ── Bottom action bar ──────────────────────────────────────────────────
+ * Layout: a centered group  [Exclude][count][Migrate]  with the pager
+ * pushed to the far right, visually detached from the centered group.
+ * The centered group sits in a full-width center track; the pager takes
+ * only its own width on the right edge.
+ * ────────────────────────────────────────────────────────────────────── */
+.action-bar {
+  flex-shrink: 0;
+  display: grid;
+  /* left spacer | centered group | right column (pager) */
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  column-gap: 24px;
+  background: #fff;
+  border-top: 1px solid #e5e7eb;
+  padding: 10px 24px;
+  min-height: 56px;
+}
+
+/* The three grouped controls — sit as one visual cluster, horizontally centered. */
+.action-bar .action-center-group {
+  grid-column: 2;
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  white-space: nowrap;
+}
+
+/* Pager — rightmost column, right-aligned so it clearly detaches from the
+ * centered group. */
+.action-bar .pager {
+  grid-column: 3;
+  justify-self: end;
+}
+
+.action-sel-count {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  white-space: nowrap;
+}
+
+.action-sel-count.has-selection {
+  color: #0f6cbd;
+  font-weight: 600;
+}
+
+.action-migrate-btn {
+  height: 36px;
+  padding: 0 26px;
+  border: 1px solid #c9cdd3;
+  border-radius: 6px;
+  background: #eaecef;
+  font-size: 13px;
+  font-weight: 600;
+  color: #9ca3af;
+  cursor: not-allowed;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.05s;
+  font-family: inherit;
+  min-width: 140px;
+}
+
+.action-migrate-btn.active {
+  background: #0f6cbd;
+  border-color: #0a57a0;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(15,108,189,0.28);
+}
+
+.action-migrate-btn.active:hover {
+  background: #0d5fa6;
+  border-color: #0a4f90;
+  box-shadow: 0 3px 10px rgba(15,108,189,0.36);
+}
+
+.action-migrate-btn.active:active {
+  background: #0a5099;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+.action-migrate-btn:disabled {
+  background: #eaecef;
+  border-color: #c9cdd3;
+  color: #9ca3af;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* ── Exclude button (destructive / danger) ─────────────────────────────── */
+.action-exclude-btn {
+  height: 36px;
+  padding: 0 20px;
+  border: 1px solid #c9cdd3;
+  border-radius: 6px;
+  background: #eaecef;
+  font-size: 13px;
+  font-weight: 600;
+  color: #9ca3af;
+  cursor: not-allowed;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.05s;
+  font-family: inherit;
+  min-width: 110px;
+}
+
+.action-exclude-btn:not(:disabled) {
+  background: #b42318;   /* enterprise red — matches SharePoint/Excel danger palette */
+  border-color: #971b12;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(180,35,24,0.28);
+}
+
+.action-exclude-btn:not(:disabled):hover {
+  background: #971b12;
+  border-color: #7a140d;
+  box-shadow: 0 3px 10px rgba(180,35,24,0.36);
+}
+
+.action-exclude-btn:not(:disabled):active {
+  background: #7a140d;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+.action-exclude-btn:disabled {
+  background: #eaecef;
+  border-color: #c9cdd3;
+  color: #9ca3af;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Danger variant of the modal confirm button — used by the Exclude flow.
+ * Extends the existing .btn-confirm-modal so layout/typography stay the
+ * same; only the color palette changes. */
+.btn-confirm-modal.btn-danger {
+  background: #b42318;
+  border-color: #971b12;
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(180,35,24,0.28);
+}
+.btn-confirm-modal.btn-danger:hover {
+  background: #971b12;
+  border-color: #7a140d;
+  box-shadow: 0 3px 10px rgba(180,35,24,0.36);
+}
+.btn-confirm-modal.btn-danger:active {
+  background: #7a140d;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+/* Green (Restore) variant of the modal confirm button — used by the Restore
+ * flow.  Matches the Migrated bucket palette. */
+.btn-confirm-modal.btn-restore {
+  background: #059669;
+  border-color: #047857;
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(5,150,105,0.28);
+}
+.btn-confirm-modal.btn-restore:hover {
+  background: #047857;
+  border-color: #065f46;
+  box-shadow: 0 3px 10px rgba(5,150,105,0.36);
+}
+.btn-confirm-modal.btn-restore:active {
+  background: #065f46;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+/* ── Restore button (used in the Excluded view) ────────────────────────── */
+.action-restore-btn {
+  height: 36px;
+  padding: 0 22px;
+  border: 1px solid #c9cdd3;
+  border-radius: 6px;
+  background: #eaecef;
+  font-size: 13px;
+  font-weight: 600;
+  color: #9ca3af;
+  cursor: not-allowed;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.05s;
+  font-family: inherit;
+  min-width: 120px;
+}
+.action-restore-btn:not(:disabled) {
+  background: #059669;
+  border-color: #047857;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(5,150,105,0.28);
+}
+.action-restore-btn:not(:disabled):hover {
+  background: #047857;
+  border-color: #065f46;
+  box-shadow: 0 3px 10px rgba(5,150,105,0.36);
+}
+.action-restore-btn:not(:disabled):active {
+  background: #065f46;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+/* ── Excluded view (recoverable soft-deleted rows) ─────────────────────── */
+.excluded-view {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+
+.excluded-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 16px 24px 12px 24px;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.excluded-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.excluded-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+  margin: 0;
+  letter-spacing: -0.1px;
+}
+
+.excluded-sub {
+  font-size: 12px;
+  color: #6b7280;
+  line-height: 1.4;
+}
+
+.excluded-back-btn {
+  flex-shrink: 0;
+}
+
+/* ── Active filter chips bar ───────────────────────────────────────────── */
+.af-bar {
+  flex-shrink: 0;
+  background: #f8fafc;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 4px 18px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 28px;
+}
+
+.af-label {
+  font-size: 10px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-right: 2px;
+}
+
+.af-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+  border-radius: 12px;
+  padding: 1px 8px 1px 8px;
+  font-size: 11px;
+  color: #1d4ed8;
+  max-width: 220px;
+}
+
+.af-col {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.af-chip > span:not(.af-col) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.af-x {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #93c5fd;
+  font-size: 10px;
+  padding: 0;
+  line-height: 1;
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
+.af-x:hover { color: #1d4ed8; }
+
+.af-clear-all {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: #dc2626;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 4px;
+}
+
+.af-clear-all:hover { background: #fee2e2; }
+
+/* ── Grid wrapper ──────────────────────────────────────────────────────── */
+.grid-wrap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background: #fff;
+}
+
+.grid-loading, .grid-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  color: #6b7280;
+  font-size: 13px;
+  z-index: 5;
+  background: #fff;
+}
+
+.spinner {
+  width: 28px; height: 28px;
+  border: 3px solid #e5e7eb;
+  border-top-color: #0f6cbd;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Table container ───────────────────────────────────────────────────── */
+.table-container {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  position: relative;
+}
+
+/* ── Excel table ───────────────────────────────────────────────────────── */
+.excel-table {
+  border-collapse: collapse;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 11.5px;
+  color: #1a1a2e;
+  min-width: 100%;
+}
+
+/* ── thead ─────────────────────────────────────────────────────────────── */
+.excel-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.excel-table thead tr {
+  background: #eaeff5;
+}
+
+.excel-table th {
+  border: 1px solid #c1cad6;
+  border-bottom: 2px solid #94a3b8;
+  padding: 0;
+  font-weight: 700;
+  font-size: 11.5px;
+  color: #1f2937;
+  white-space: nowrap;
+  position: relative;
+  background: #eaeff5;
+  height: 34px;
+  user-select: none;
+}
+
+.th-inner {
+  display: flex;
+  align-items: center;
+  padding: 0 4px 0 8px;
+  height: 100%;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.th-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.1px;
+}
+
+.th-sort-icon {
+  font-size: 9px;
+  color: #0f6cbd;
+  flex-shrink: 0;
+}
+
+/* Filter button — real control, not a decoration */
+.th-filter-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  color: #64748b;
+  padding: 0;
+  line-height: 0;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: 2px;
+}
+
+.th-filter-svg {
+  display: block;
+  pointer-events: none;
+}
+
+.th-filter-btn:hover {
+  color: #0f6cbd;
+  background: #dbeafe;
+  border-color: #bfdbfe;
+}
+
+.th-filter-btn.active {
+  color: #fff;
+  background: #0f6cbd;
+  border-color: #0a57a0;
+  box-shadow: 0 0 0 2px rgba(15,108,189,0.18);
+}
+
+.th-filter-btn.active:hover {
+  background: #0d5fa6;
+  color: #fff;
+}
+
+/* column resize handle */
+.th-resize {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.th-resize:hover, .th-resize.dragging {
+  background: #0f6cbd;
+}
+
+/* frozen columns */
+.col-frozen {
+  position: sticky;
+  z-index: 15;
+  background: #eaeff5;
+}
+
+/* Header <th> must also be sticky. Without this the generic
+   `.excel-table th { position: relative }` rule wins by cascade order and
+   the `left: NNpx` value is applied as a *relative* offset, shifting the
+   #, checkbox and File-Name headers to the right and clipping them. */
+.excel-table thead th.col-frozen {
+  position: sticky;
+}
+
+.col-frozen-0 { left: 0; }
+.col-frozen-1 { left: 40px; }
+.col-frozen-2 { left: 84px; }
+
+/* ── tbody ─────────────────────────────────────────────────────────────── */
+.excel-table tbody tr {
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+  height: 26px;
+}
+
+.excel-table tbody tr:hover {
+  background: #f0f7ff !important;
+}
+
+.excel-table tbody tr.row-selected {
+  background: #eff6ff !important;
+}
+
+.excel-table tbody tr.row-migrated {
+  background: #f0fdf4 !important;
+  color: #6b7280;
+}
+
+.excel-table tbody tr.row-migrated:hover {
+  background: #dcfce7 !important;
+}
+
+.excel-table td {
+  border: 1px solid #e5e7eb;
+  padding: 2px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 0;
+  vertical-align: middle;
+}
+
+/* frozen body cells */
+.excel-table tbody td.col-frozen {
+  background: inherit;
+  z-index: 10;
+}
+
+.excel-table tbody tr:hover td.col-frozen,
+.excel-table tbody tr.row-selected td.col-frozen {
+  background: inherit;
+}
+
+/* ── Special column widths ─────────────────────────────────────────────── */
+.col-rn  { width: 40px; min-width: 40px; max-width: 40px; }
+.col-cb  { width: 44px; min-width: 44px; max-width: 44px; }
+
+/* ── Row number cell ───────────────────────────────────────────────────── */
+.cell-rn {
+  text-align: right;
+  color: #9ca3af;
+  font-family: monospace;
+  font-size: 10px;
+  padding-right: 6px;
+  border-right: 1px solid #c8d0da;
+  background: #f8fafb;
+  user-select: none;
+}
+
+thead .cell-rn {
+  background: #eaeff5;
+  border-right: 1px solid #c1cad6;
+  color: #64748b;
+  text-align: center;
+  padding-right: 0;
+  font-weight: 700;
+  font-family: inherit;
+  font-size: 11px;
+}
+
+/* ── Checkbox cell ─────────────────────────────────────────────────────── */
+.cell-cb {
+  text-align: center;
+  padding: 0;
+  border-right: 1px solid #c8d0da;
+}
+
+.cell-cb input[type="checkbox"] {
+  cursor: pointer;
+  width: 15px;
+  height: 15px;
+  accent-color: #0f6cbd;
+}
+
+.cell-cb input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ── Checkbox column header — master select control ────────────────────── */
+.th-cb-hdr {
+  background: #eaeff5 !important;
+  border: 1px solid #c1cad6 !important;
+  border-bottom: 2px solid #94a3b8 !important;
+  border-right: 1px solid #c1cad6 !important;
+  text-align: center !important;
+  vertical-align: middle !important;
+  cursor: pointer;
+  user-select: none;
+  padding: 0 !important;
+}
+
+.th-cb-hdr:hover {
+  background: #dde5ee !important;
+}
+
+.th-cb-hdr input[type="checkbox"] {
+  display: block;
+  margin: 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: #0f6cbd;
+  cursor: pointer;
+}
+
+/* ── Status badges ─────────────────────────────────────────────────────── */
+.status-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.status-success { background: #d1fae5; color: #065f46; }
+.status-failed  { background: #fee2e2; color: #991b1b; }
+.status-partial { background: #fef3c7; color: #92400e; }
+.status-migrated { background: #dbeafe; color: #1e40af; }
+.status-review  { background: #fce7f3; color: #9d174d; }
+.status-yes     { background: #fce7f3; color: #9d174d; }
+.status-no      { color: #6b7280; font-size: 10px; }
+
+/* ── File name link ────────────────────────────────────────────────────── */
+.cell-link {
+  color: #0f6cbd;
+  text-decoration: none;
+  font-size: 11px;
+}
+
+.cell-link:hover { text-decoration: underline; }
+
+.cell-link-icon {
+  font-size: 9px;
+  opacity: 0.6;
+  margin-left: 2px;
+}
+
+.cell-empty { color: #d1d5db; }
+
+/* ── Missing fields chips ──────────────────────────────────────────────── */
+.mf-chip {
+  display: inline-block;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 10px;
+  color: #78350f;
+  margin-right: 3px;
+  white-space: nowrap;
+}
+
+/* ── Pagination ────────────────────────────────────────────────────────── */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.pg-btn {
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 3px;
+  padding: 2px 7px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #374151;
+  min-width: 26px;
+  text-align: center;
+  transition: background 0.1s;
+}
+
+.pg-btn:hover:not(:disabled):not(.active) { background: #f3f4f6; }
+.pg-btn:disabled { opacity: 0.4; cursor: default; }
+.pg-btn.active {
+  background: #0f6cbd;
+  border-color: #0a5099;
+  color: #fff;
+  font-weight: 700;
+}
+
+/* ── Filter panel ──────────────────────────────────────────────────────── */
+.fp-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+}
+
+.fp-panel {
+  position: fixed;
+  z-index: 9999;
+  background: #fff;
+  border: 1px solid #c8d0da;
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  max-height: 480px;
+  overflow: hidden;
+}
+
+.fp-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid #e5e7eb;
+  gap: 8px;
+  background: #f8fafc;
+}
+
+.fp-title {
+  flex: 1;
+  font-weight: 700;
+  font-size: 13px;
+  color: #1a1a2e;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fp-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #9ca3af;
+  font-size: 14px;
+  padding: 3px 6px;
+  line-height: 1;
+  border-radius: 4px;
+}
+
+.fp-close:hover { color: #374151; background: #e5e7eb; }
+
+.fp-sort-row {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 10px;
+  gap: 2px;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.fp-sort-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: #374151;
+  text-align: left;
+  padding: 5px 8px;
+  border-radius: 4px;
+  transition: background 0.1s;
+}
+
+.fp-sort-btn:hover { background: #eef2f7; }
+
+.fp-subtabs {
+  display: flex;
+  border-bottom: 1px solid #e5e7eb;
+  background: #fafbfc;
+}
+
+.fp-subtab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 8px 10px;
+  color: #6b7280;
+  transition: color 0.1s;
+  font-family: inherit;
+}
+
+.fp-subtab:hover { color: #374151; }
+.fp-subtab.active {
+  color: #0f6cbd;
+  border-bottom-color: #0f6cbd;
+  font-weight: 600;
+  background: #fff;
+}
+
+.fp-search {
+  padding: 10px 12px 6px;
+}
+
+.fp-search input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 12px;
+  outline: none;
+  background: #fafafa;
+  font-family: inherit;
+}
+
+.fp-search input:focus {
+  border-color: #0f6cbd;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(15,108,189,0.10);
+}
+
+.fp-select-all {
+  padding: 4px 12px 6px;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.fp-select-all label,
+.fp-values label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #374151;
+}
+
+.fp-select-all label:hover,
+.fp-values label:hover {
+  background: #eff6ff;
+}
+
+.fp-select-all input[type="checkbox"],
+.fp-values input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: #0f6cbd;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.fp-count {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-left: 4px;
+}
+
+.fp-values {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 10px 6px;
+  max-height: 220px;
+}
+
+.fp-empty-msg {
+  padding: 8px;
+  color: #9ca3af;
+  font-size: 11px;
+  text-align: center;
+}
+
+.fp-val-blank { color: #9ca3af; font-style: italic; }
+
+.fp-adv-filter {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fp-adv-filter label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.fp-adv-filter select,
+.fp-adv-filter input[type="text"],
+.fp-adv-filter input[type="date"] {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 12px;
+  outline: none;
+  background: #fafafa;
+  font-family: inherit;
+}
+
+.fp-adv-filter select:focus,
+.fp-adv-filter input:focus {
+  border-color: #0f6cbd;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(15,108,189,0.10);
+}
+
+/* Enhanced File Name filter panel — shows both value list AND text filter
+   stacked in the same popup (no tabs).  Slightly taller so both fit. */
+.fp-panel-fn { max-height: 560px; }
+.fp-panel-fn .fp-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.fp-panel-fn .fp-section:first-of-type {
+  flex: 1 1 auto;
+  min-height: 140px;
+  overflow: hidden;
+}
+.fp-panel-fn .fp-section-text {
+  border-top: 1px solid #e5e7eb;
+  background: #fafbfc;
+  padding-bottom: 4px;
+}
+.fp-panel-fn .fp-section-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 10px 12px 4px;
+}
+.fp-panel-fn .fp-adv-filter { padding: 4px 12px 10px; gap: 6px; }
+.fp-panel-fn .fp-values { flex: 1 1 auto; }
+
+.fp-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-top: 1px solid #e5e7eb;
+  gap: 8px;
+  background: #fafbfc;
+}
+
+.fp-btn-clear {
+  background: #fff;
+  border: 1px solid #fca5a5;
+  border-radius: 5px;
+  padding: 6px 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+  color: #dc2626;
+  font-weight: 600;
+  transition: background 0.1s;
+  font-family: inherit;
+}
+
+.fp-btn-clear:hover { background: #fee2e2; }
+
+.fp-btn-cancel {
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  padding: 6px 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+  color: #374151;
+  font-family: inherit;
+}
+
+.fp-btn-cancel:hover { background: #f3f4f6; }
+
+.fp-btn-apply {
+  background: #0f6cbd;
+  border: 1px solid #0a5099;
+  border-radius: 5px;
+  padding: 6px 16px;
+  font-size: 11.5px;
+  cursor: pointer;
+  color: #fff;
+  font-weight: 600;
+  transition: background 0.1s;
+  font-family: inherit;
+}
+
+.fp-btn-apply:hover { background: #0a5099; }
+
+/* ── Column visibility panel ───────────────────────────────────────────── */
+.colpanel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 8990;
+}
+
+.colpanel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 9000;
+  background: #fff;
+  border: 1px solid #c8d0da;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+  width: 220px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.colpanel-head {
+  padding: 4px 12px 6px;
+  font-weight: 700;
+  font-size: 11px;
+  color: #374151;
+  border-bottom: 1px solid #e5e7eb;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.colpanel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 11px;
+  color: #374151;
+  transition: background 0.1s;
+}
+
+.colpanel-row:hover { background: #f0f7ff; }
+
+.colpanel-row input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  accent-color: #0f6cbd;
+  cursor: pointer;
+}
+
+/* ── Migration modal ───────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.45);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.2);
+  width: 440px;
+  max-width: 90vw;
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-icon {
+  font-size: 20px;
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1a1a2e;
+}
+
+.modal-body {
+  padding: 16px 20px;
+  font-size: 13px;
+  color: #374151;
+  line-height: 1.6;
+}
+
+.modal-body strong { color: #0f6cbd; font-size: 15px; }
+
+.modal-note {
+  margin-top: 10px;
+  font-size: 11px;
+  color: #6b7280;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.modal-footer {
+  padding: 12px 20px 16px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid #f3f4f6;
+}
+
+.btn-cancel-modal {
+  padding: 7px 18px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  color: #374151;
+}
+
+.btn-cancel-modal:hover { background: #f3f4f6; }
+
+.btn-confirm-modal {
+  padding: 7px 18px;
+  border: 1px solid #0a5099;
+  border-radius: 5px;
+  background: #0f6cbd;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #fff;
+}
+
+.btn-confirm-modal:hover { background: #0a5099; }
+
+/* ── Toast notification ────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a3a5c;
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 6px;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+  z-index: 20000;
+  animation: fadeInUp 0.2s ease;
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ── Scrollbars ────────────────────────────────────────────────────────── */
+.table-container::-webkit-scrollbar { width: 10px; height: 10px; }
+.table-container::-webkit-scrollbar-track { background: #f1f3f5; }
+.table-container::-webkit-scrollbar-thumb { background: #c8d0da; border-radius: 4px; }
+.table-container::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+.fp-values::-webkit-scrollbar { width: 6px; }
+.fp-values::-webkit-scrollbar-thumb { background: #c8d0da; border-radius: 3px; }
+
+/* ── Tooltip ───────────────────────────────────────────────────────────── */
+[data-tooltip] { position: relative; }
+[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a2e;
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  max-width: 320px;
+  word-break: break-word;
+  z-index: 30000;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  line-height: 1.5;
+}
+
+/* column wrapper for relative positioning of panel */
+.col-btn-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+/* ── Screens ───────────────────────────────────────────────────────────── */
+.screen {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.screen-center {
+  align-items: center;
+  justify-content: center;
+  background: #f0f2f5;
+  overflow: auto;
+}
+
+.screen-review {
+  flex-direction: column;
+}
+
+/* ── Source Data card (Start) ──────────────────────────────────────────── */
+.source-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 40px 48px 36px;
+  max-width: 640px;
+  width: 90%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.07);
+  text-align: center;
+}
+
+.source-eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  color: #0f6cbd;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+
+.source-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #111827;
+  margin: 0;
+  line-height: 1.25;
+}
+
+.source-desc {
+  font-size: 13px;
+  color: #6b7280;
+  margin: 0;
+  line-height: 1.55;
+  max-width: 320px;
+}
+
+.source-error {
+  width: 100%;
+  color: #dc2626;
+  font-size: 12px;
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
+  border-radius: 5px;
+  padding: 8px 12px;
+  text-align: center;
+  margin-top: 4px;
+}
+
+.source-start-btn {
+  margin-top: 14px;
+  height: 42px;
+  min-width: 140px;
+  padding: 0 36px;
+  background: #0f6cbd;
+  border: 1px solid #0a57a0;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.source-start-btn:hover:not(:disabled) {
+  background: #0a5099;
+  box-shadow: 0 2px 8px rgba(15,108,189,0.28);
+}
+
+.source-start-btn:disabled {
+  background: #94a3b8;
+  border-color: #94a3b8;
+  color: #fff;
+  cursor: default;
+}
+
+.source-start-spinner {
+  display: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: source-spin 0.8s linear infinite;
+}
+
+.source-start-btn.is-loading .source-start-spinner { display: inline-block; }
+
+@keyframes source-spin { to { transform: rotate(360deg); } }
+
+/* ── Source Data action row (Start · result · Next) ────────────────────── */
+.source-actions {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  justify-content: center;
+  width: 100%;
+}
+
+/* Keep Start's own top margin from the pre-existing rule; the row handles spacing */
+.source-actions .source-start-btn { margin-top: 0; }
+
+/* Inline result badge — subtle success indicator, never dashboard-sized */
+.source-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  border-radius: 20px;
+  color: #065f46;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.source-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #059669;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.source-result-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.source-result-count {
+  font-weight: 700;
+  color: #064e3b;
+}
+
+.source-result-label {
+  color: #065f46;
+  font-weight: 500;
+}
+
+/* Next button — visually secondary to Start so Start doesn't lose focus */
+.source-next-btn {
+  height: 42px;
+  min-width: 120px;
+  padding: 0 24px;
+  background: #fff;
+  border: 1px solid #0a57a0;
+  border-radius: 6px;
+  color: #0a57a0;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+  font-family: inherit;
+}
+
+.source-next-btn:hover {
+  background: #eff6ff;
+  box-shadow: 0 2px 8px rgba(15,108,189,0.18);
+}
+
+/* ── Migrate-yes badge (green) ─────────────────────────────────────────── */
+.status-migrate-yes { background: #d1fae5; color: #065f46; }

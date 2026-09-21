@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Contract Migration Review</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header (always visible) ──────────────────────────────────────── -->
+  <div class="app-header">
+    <div class="app-brand">
+      <span class="app-title">Contract Migration Review</span>
+    </div>
+  </div>
+
+  <!-- ── Screen 1: Source Data (Start · Result · Next in one action row) ── -->
+  <div class="screen screen-center" id="screen-source">
+    <div class="source-card">
+      <div class="source-eyebrow">Source Data</div>
+      <h2 class="source-title">Contract Document Discovery</h2>
+      <p class="source-desc">Fetch the latest documents for manual review.</p>
+      <div class="source-error" id="source-error" style="display:none"></div>
+
+      <div class="source-actions">
+        <button class="source-start-btn" id="source-start-btn" type="button">
+          <span class="source-start-label">Start</span>
+          <span class="source-start-spinner" aria-hidden="true"></span>
+        </button>
+
+        <div class="source-result" id="source-result" hidden>
+          <span class="source-check" aria-hidden="true">&#10003;</span>
+          <span class="source-result-text">
+            <span class="source-result-count" id="source-result-count">0</span>
+            <span class="source-result-label" id="source-result-label">documents found</span>
+          </span>
+        </div>
+
+        <button class="source-next-btn" id="source-next-btn" type="button" hidden>
+          Next &#8594;
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Screen 3: Manual Review ─────────────────────────────────────── -->
+  <div class="screen screen-review" id="screen-review" style="display:none">
+
+    <!-- Summary buckets (clickable status filters).
+         Order: Total | Migrated | Pending | Excluded | Selected.
+         Total = active + excluded (full document population).
+         Clicking Excluded switches to the Excluded view. -->
+    <div class="buckets" id="buckets" role="tablist" aria-label="Migration status filters">
+      <button type="button" class="bucket bucket-total active" data-bucket="all" role="tab" aria-selected="true" title="Show all active documents">
+        <span class="bucket-label">Total Documents</span>
+        <span class="bucket-value" id="bucket-total">0</span>
+      </button>
+      <button type="button" class="bucket bucket-migrated" data-bucket="migrated" role="tab" aria-selected="false" title="Show only migrated documents">
+        <span class="bucket-label">Migrated</span>
+        <span class="bucket-value" id="bucket-migrated">0</span>
+      </button>
+      <button type="button" class="bucket bucket-pending" data-bucket="pending" role="tab" aria-selected="false" title="Show only pending documents">
+        <span class="bucket-label">Pending</span>
+        <span class="bucket-value" id="bucket-pending">0</span>
+      </button>
+      <button type="button" class="bucket bucket-selected" data-bucket="selected" role="tab" aria-selected="false" title="Show only currently selected documents" disabled>
+        <span class="bucket-label">Selected</span>
+        <span class="bucket-value" id="bucket-selected">0</span>
+      </button>
+      <button type="button" class="bucket bucket-excluded" data-bucket="excluded" role="tab" aria-selected="false" title="View recoverable excluded documents">
+        <span class="bucket-label">Excluded</span>
+        <span class="bucket-value" id="bucket-excluded">0</span>
+      </button>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <div class="tb-left">
+        <div class="tb-search">
+          <span class="tb-search-icon">&#8981;</span>
+          <input type="text" id="search-input" placeholder="Search files, customers, agreements…" autocomplete="off">
+          <button class="tb-search-clear" id="search-clear" title="Clear search">&#x2715;</button>
+        </div>
+        <button class="tb-btn" id="clear-filters-btn" disabled>Clear Filters</button>
+        <div id="col-btn-wrap" class="col-btn-wrap">
+          <button class="tb-btn" id="col-btn">Columns &#9660;</button>
+        </div>
+      </div>
+      <div class="tb-right">
+        <button class="tb-btn tb-export-btn" id="export-csv-btn" type="button" title="Export current filtered results as CSV">
+          <span class="tb-export-icon" aria-hidden="true">&#8681;</span>
+          Export CSV
+        </button>
+      </div>
+    </div>
+
+    <!-- Active filter chips -->
+    <div class="af-bar" id="af-bar" style="display:none"></div>
+
+    <!-- Grid -->
+    <div class="grid-wrap">
+      <div class="grid-loading" id="grid-loading" style="display:none">
+        <div class="spinner"></div>
+        <span>Loading…</span>
+      </div>
+      <div class="grid-error" id="grid-error" style="display:none"></div>
+      <div class="table-container" style="display:none">
+        <table class="excel-table" id="table-root"></table>
+      </div>
+    </div>
+
+    <!-- Bottom action bar: centered [Exclude | count | Migrate] group,
+         with pagination visually separated on the right. -->
+    <div class="action-bar" id="action-bar">
+      <div class="action-center-group" id="action-center-group">
+        <button class="action-exclude-btn" id="exclude-btn" type="button" disabled title="Exclude selected files from the migration review list (recoverable)">Exclude</button>
+        <span class="action-sel-count" id="sel-count">No files selected</span>
+        <button class="action-migrate-btn" id="migrate-btn" disabled>Migrate</button>
+      </div>
+      <div class="pager" id="pager"></div>
+    </div>
+
+    <!-- ── Excluded view (recoverable soft-deleted rows) ─────────────────
+         Reuses the same page shell (buckets remain visible so the user can
+         click back to "Total"/"Pending" to return to the active list). -->
+    <div class="excluded-view" id="excluded-view" style="display:none">
+      <div class="excluded-header">
+        <div class="excluded-title-wrap">
+          <h2 class="excluded-title">Excluded Documents</h2>
+          <span class="excluded-sub" id="excluded-sub">These documents have been excluded from the migration review list. They are not deleted and can be restored.</span>
+        </div>
+        <button class="tb-btn excluded-back-btn" id="excluded-back-btn" type="button" title="Return to the active Manual Review list">&#8592; Back to Manual Review</button>
+      </div>
+
+      <div class="grid-wrap">
+        <div class="table-container" style="display:none">
+          <table class="excel-table" id="excluded-table-root"></table>
+        </div>
+        <div class="grid-error" id="excluded-empty" style="display:none">No excluded documents.</div>
+      </div>
+
+      <div class="action-bar" id="excluded-action-bar">
+        <div class="action-center-group">
+          <span class="action-sel-count" id="excluded-sel-count">No files selected</span>
+          <button class="action-restore-btn" id="restore-btn" type="button" disabled title="Restore selected files back to the active Manual Review list">Restore</button>
+        </div>
+        <div class="pager" id="excluded-pager"></div>
+      </div>
+    </div>
+
+  </div><!-- /screen-review -->
+
+</div>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
