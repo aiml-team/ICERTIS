@@ -14,6 +14,12 @@
     <div class="app-brand">
       <span class="app-title">Contract Migration Review</span>
     </div>
+    <!-- Session badge (email + Logout).  Populated by app.js from
+         /api/auth/me on load; hidden until we know who is logged in. -->
+    <div class="app-user" id="app-user" style="display:none">
+      <span class="app-user-email" id="app-user-email" title=""></span>
+      <button class="app-user-logout" id="app-user-logout" type="button" title="Sign out">Logout</button>
+    </div>
   </div>
 
   <!-- ── Screen 1: Source Data (Start · Result · Next in one action row) ── -->

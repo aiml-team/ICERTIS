@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in · Contract Migration Review</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/login.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- Same header as the main app so branding is consistent. -->
+  <div class="app-header">
+    <div class="app-brand">
+      <span class="app-title">Contract Migration Review</span>
+    </div>
+  </div>
+
+  <div class="screen screen-center">
+    <form class="login-card" id="login-form" autocomplete="off" novalidate>
+      <div class="login-eyebrow">Sign in</div>
+      <h2 class="login-title">Contract Migration Review</h2>
+      <p class="login-desc">Enter your company email and application password to continue.</p>
+
+      <div class="login-error" id="login-error" style="display:none" role="alert"></div>
+
+      <label class="login-field">
+        <span class="login-label">Email</span>
+        <input type="email" id="login-email" name="email"
+               placeholder="name@bs.nttdata.com"
+               autocomplete="username"
+               spellcheck="false"
+               required>
+      </label>
+
+      <label class="login-field">
+        <span class="login-label">Password</span>
+        <input type="password" id="login-password" name="password"
+               placeholder="Application password"
+               autocomplete="current-password"
+               required>
+      </label>
+
+      <button class="login-submit-btn" id="login-submit-btn" type="submit">
+        <span class="login-submit-label">Login</span>
+        <span class="login-submit-spinner" aria-hidden="true"></span>
+      </button>
+    </form>
+  </div>
+
+</div>
+<script src="/static/js/login.js"></script>
+</body>
+</html>

@@ -247,6 +247,55 @@ def ensure_migration_status_column() -> None:
         cn.commit()
 
 
+# ── User-session tracking table ────────────────────────────────────────────
+# Lightweight table populated by the shared-password login layer.  Its ONLY
+# purpose is to know which company email owns the current session id and to
+# provide an audit trail of logins/logouts.  The shared password itself is
+# NEVER stored here.
+_USER_SESSIONS_TABLE = "user_sessions"
+
+_USER_SESSIONS_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables WHERE name = '{table}' AND schema_id = SCHEMA_ID('dbo')
+)
+BEGIN
+    CREATE TABLE dbo.[{table}] (
+        id             BIGINT        IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        email          NVARCHAR(256) NOT NULL,
+        session_id     NVARCHAR(128) NOT NULL,
+        login_time     DATETIME2     NOT NULL CONSTRAINT DF_{table}_login    DEFAULT SYSUTCDATETIME(),
+        last_activity  DATETIME2     NOT NULL CONSTRAINT DF_{table}_activity DEFAULT SYSUTCDATETIME(),
+        logout_time    DATETIME2     NULL,
+        is_active      BIT           NOT NULL CONSTRAINT DF_{table}_active   DEFAULT (1),
+        user_agent     NVARCHAR(512) NULL,
+        remote_ip      NVARCHAR(64)  NULL
+    );
+    CREATE UNIQUE INDEX UX_{table}_session_id ON dbo.[{table}](session_id);
+    CREATE INDEX IX_{table}_email_active     ON dbo.[{table}](email, is_active);
+END
+"""
+
+
+def user_sessions_table_name() -> str:
+    """Fixed name — kept as a helper so callers never hand-concatenate."""
+    return _USER_SESSIONS_TABLE
+
+
+def ensure_user_sessions_table() -> None:
+    """Idempotent create of the user_sessions tracking table.
+
+    Called lazily by the auth service on the first login/logout so
+    normal app startup isn't blocked on DDL.  The shared login
+    password is NEVER stored — this table only records who logged
+    in, when, and their session id.
+    """
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(_USER_SESSIONS_DDL.format(table=_USER_SESSIONS_TABLE))
+        cn.commit()
+    logger.info("Schema ensured for table dbo.%s", _USER_SESSIONS_TABLE)
+
+
 def excluded_table_name() -> str:
     """Convention: <ActiveTable>_Excluded.  Kept as a helper so callers never
     hand-concatenate the name."""

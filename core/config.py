@@ -47,6 +47,25 @@ class Settings:
     POWER_AUTOMATE_SYNC:    bool = os.getenv("POWER_AUTOMATE_SYNC", "0") == "1"
     POWER_AUTOMATE_API_KEY: str  = os.getenv("POWER_AUTOMATE_API_KEY", "")
 
+    # ── Lightweight shared-password login ────────────────────────────────
+    # This is NOT an authentication system — it exists only to identify
+    # the current user (by company email) and separate concurrent sessions
+    # so future migration actions can record `StartedBy` / `SessionId`.
+    #
+    # APP_SHARED_PASSWORD   the one password every user types (default
+    #                       "AIML@2025"; override in .env for production)
+    # APP_COMPANY_DOMAIN    the ONLY email domain accepted at login
+    #                       (case-insensitive exact match, no subdomains)
+    # APP_SESSION_COOKIE    HttpOnly cookie name that carries the session id
+    # APP_SESSION_TTL_HOURS session lifetime; expired sessions redirect to
+    #                       the login page (default 12h)
+    APP_SHARED_PASSWORD:   str = os.getenv("APP_SHARED_PASSWORD", "AIML@2026")
+    APP_COMPANY_DOMAIN:    str = os.getenv("APP_COMPANY_DOMAIN", "bs.nttdata.com")
+    APP_SESSION_COOKIE:    str = os.getenv("APP_SESSION_COOKIE", "cmr_session")
+    APP_SESSION_TTL_HOURS: int = int(os.getenv("APP_SESSION_TTL_HOURS", "12"))
+    # Secure cookie flag — turn on when deployed over HTTPS.
+    APP_SESSION_COOKIE_SECURE: bool = os.getenv("APP_SESSION_COOKIE_SECURE", "0") == "1"
+
     @property
     def odbc_connection_string(self) -> str:
         return (

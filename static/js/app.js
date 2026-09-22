@@ -2355,7 +2355,12 @@ function initSourceScreen() {
     errorEl.style.display = 'none';
 
     try {
-      const res = await fetch('/api/contracts', { cache: 'no-store' });
+      const res = await fetch('/api/contracts', { cache: 'no-store', credentials: 'same-origin' });
+      if (res.status === 401) {
+        // Session expired between load and Start — bounce to login.
+        window.location.assign('/login');
+        return;
+      }
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
         throw new Error(err.detail || `HTTP ${res.status}`);
@@ -2535,8 +2540,49 @@ function initReviewEventListeners() {
   // Page size is fixed at 100; no rows-per-page dropdown.
 }
 
+/* ── Session badge + logout ────────────────────────────────────────────────
+ * On load, ask /api/auth/me who's logged in and paint the email into the
+ * header.  If the server says 401 (session expired), redirect to /login.
+ * Logout POSTs to /api/auth/logout and then redirects to /login. */
+async function initSessionBadge() {
+  const wrap    = document.getElementById('app-user');
+  const emailEl = document.getElementById('app-user-email');
+  const btn     = document.getElementById('app-user-logout');
+  if (!wrap || !emailEl || !btn) return;
+
+  try {
+    const res = await fetch('/api/auth/me', { credentials: 'same-origin', cache: 'no-store' });
+    if (res.status === 401) {
+      window.location.assign('/login');
+      return;
+    }
+    if (!res.ok) return;
+    const body = await res.json();
+    if (body && typeof body.email === 'string' && body.email) {
+      emailEl.textContent = body.email;
+      emailEl.title       = body.email;
+      wrap.style.display  = '';
+    }
+  } catch (_) {
+    /* leave the badge hidden — non-fatal */
+  }
+
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (_) { /* proceed to redirect anyway */ }
+    window.location.assign('/login');
+  });
+}
+
 /* ── Bootstrap ──────────────────────────────────────────────────────────── */
 function init() {
+  initSessionBadge();
   initSourceScreen();
   initReviewEventListeners();
   showScreen('source');
