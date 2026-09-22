@@ -478,6 +478,42 @@ html, body {
   box-shadow: none;
 }
 
+/* Locked-by-per-user-workload-lock state.  Same visual weight as the
+   regular disabled state but tinted so users can distinguish "you have
+   nothing selected" (grey) from "your previous batch is still running"
+   (warm amber) at a glance. */
+.action-migrate-btn.locked,
+.action-migrate-btn.locked:disabled {
+  background: #fdf3e2;
+  border-color: #e5c07b;
+  color: #8a5a00;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* "My Active: N" pill shown next to Migrate whenever the logged-in
+   user has active rows in flight.  Compact, informational, matches
+   the small metadata badges used elsewhere on the page. */
+.action-my-active {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 12px;
+  background: #eef4fa;
+  border: 1px solid #cddceb;
+  color: #0a5099;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  margin-left: 4px;
+}
+.action-my-active.locked {
+  background: #fdf3e2;
+  border-color: #e5c07b;
+  color: #8a5a00;
+}
+
 /* ── Exclude button (destructive / danger) ─────────────────────────────── */
 .action-exclude-btn {
   height: 36px;
@@ -1819,6 +1855,103 @@ thead .cell-rn {
 
 .btn-confirm-modal:hover { background: #0a5099; }
 
+/* ── Wide Copy-to-Destination modal ────────────────────────────────────── */
+/* Used by the migration-confirmation dialog so the Source/Destination
+ * preview panels don't wrap awkwardly at the default 440px width. */
+.modal.modal-wide { width: 620px; }
+
+.modal-lead {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #1a1a2e;
+}
+
+.migrate-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 10px 0 12px;
+  padding-right: 4px;
+}
+
+.migrate-groups-empty {
+  padding: 10px;
+  color: #b45309;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.migrate-group {
+  border: 1px solid #e5e7eb;
+  border-radius: 5px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.migrate-group-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+}
+
+.migrate-group-label {
+  color: #6b7280;
+  min-width: 40px;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  font-weight: 600;
+}
+
+.migrate-group-value {
+  color: #1a1a2e;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── Migration Status cell ──────────────────────────────────────────────
+ * Composite cell shown in the "Migration Status" column.  Combines the
+ * UI bucket badge with either a destination link (Migrated) or an
+ * error note (Failed).  Kept compact so it does not blow up row height. */
+.migstatus-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.migstatus-cell .status-badge { flex: none; }
+.migstatus-dest {
+  font-size: 11px;
+  color: #0f6cbd;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.migstatus-dest:hover { text-decoration: underline; }
+.migstatus-note {
+  font-size: 11px;
+  color: #6b7280;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 /* ── Toast notification ────────────────────────────────────────────────── */
 .toast {
   position: fixed;
@@ -1838,6 +1971,108 @@ thead .cell-rn {
 @keyframes fadeInUp {
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
   to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ── Live migration progress badge ─────────────────────────────────────
+   Sticky pill shown from the moment the user clicks Migrate until every
+   file in the current submission cohort reaches a terminal state.  Sits
+   top-right, above the KPI counters, and updates on every /sync tick. */
+.mig-progress {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  min-width: 240px;
+  max-width: 420px;
+  padding: 10px 14px 10px 12px;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-left: 4px solid #1a3a5c;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.10);
+  font-size: 13px;
+  color: #1a3a5c;
+  z-index: 21000;
+  display: none;
+  align-items: center;
+  gap: 10px;
+  animation: fadeInRight 0.22s ease;
+}
+.mig-progress.is-visible { display: flex; }
+.mig-progress.state-submitting { border-left-color: #6b7280; }
+.mig-progress.state-progress   { border-left-color: #2563eb; }
+.mig-progress.state-success    { border-left-color: #16a34a; }
+.mig-progress.state-partial    { border-left-color: #f59e0b; }
+.mig-progress.state-failed     { border-left-color: #dc2626; }
+
+.mig-progress .mp-icon {
+  flex: 0 0 auto;
+  width: 18px; height: 18px;
+  display: inline-block;
+  font-weight: bold;
+  font-size: 16px;
+  line-height: 18px;
+  text-align: center;
+}
+.mig-progress.state-submitting .mp-icon,
+.mig-progress.state-progress   .mp-icon {
+  color: #2563eb;
+  animation: spin 1s linear infinite;
+}
+.mig-progress.state-success  .mp-icon { color: #16a34a; }
+.mig-progress.state-partial  .mp-icon { color: #f59e0b; }
+.mig-progress.state-failed   .mp-icon { color: #dc2626; }
+
+.mig-progress .mp-body { flex: 1 1 auto; min-width: 0; }
+.mig-progress .mp-title {
+  font-weight: 600;
+  line-height: 1.25;
+  color: #1a3a5c;
+}
+.mig-progress .mp-sub {
+  font-size: 11.5px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+.mig-progress .mp-bar {
+  height: 4px;
+  background: #eef1f5;
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.mig-progress .mp-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: #2563eb;
+  transition: width 0.35s ease, background 0.2s ease;
+}
+.mig-progress.state-success .mp-bar-fill { background: #16a34a; }
+.mig-progress.state-partial .mp-bar-fill { background: #f59e0b; }
+.mig-progress.state-failed  .mp-bar-fill { background: #dc2626; }
+
+.mig-progress .mp-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: #9ca3af;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  display: none;
+}
+.mig-progress .mp-close:hover { color: #1a3a5c; }
+/* Only show the dismiss button on non-transient (partial/failed) states. */
+.mig-progress.state-partial .mp-close,
+.mig-progress.state-failed  .mp-close { display: inline-block; }
+
+@keyframes fadeInRight {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
 /* ── Scrollbars ────────────────────────────────────────────────────────── */

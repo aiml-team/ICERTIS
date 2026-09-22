@@ -16,6 +16,11 @@ const COL_CFG = [
   { f: 'missingFields',          h: 'Missing Fields',      ft: 'text', w: 190 },
   { f: 'migrate',                h: 'Migrate',             ft: 'text', w: 80  },
   { f: 'migratedDate',           h: 'Migrated Date',       ft: 'date', w: 180 },
+  // Migration Status — rich cell: In Processing (Retrying N/M) · Destination
+  // link when Migrated · Failed with error tooltip.  Sourced entirely from
+  // columns the sync poller keeps fresh (migrationStatus + retryCount +
+  // destinationUrl + errorMessage + migrationRequestId).
+  { f: 'migrationStatus',        h: 'Migration Status',    ft: 'text', w: 200 },
   { f: 'fileID',                 h: 'File ID',             ft: 'text', w: 80  },
   // hidden by default
   { f: 'opportunityID',          h: 'Opportunity ID',      ft: 'text', w: 120, hide: true },
@@ -96,9 +101,10 @@ const state = {
   sourceCount:      0,
 
   /* ── Excluded documents (recoverable soft-delete) ─────────────────────
-   * Rows live in the ContractInventory_Excluded table server-side; the UI
-   * fetches them on demand via /api/excluded and lets the user Restore
-   * them back into the active list.
+   * Excluded rows live on the SAME master ContractInventory table with
+   * Excluded='Yes' as a status flag (no physical row move).  The UI fetches
+   * them on demand via /api/excluded and lets the user Restore them
+   * (UPDATE Excluded='No') back into the active list.
    * ─────────────────────────────────────────────────────────────────── */
   currentView:        'review',   // 'review' | 'excluded'
   excludedData:       [],
@@ -106,10 +112,32 @@ const state = {
   excludedPage:       1,
   excludedLoaded:     false,      // set true after first /api/excluded fetch
   // Server-authoritative population counts (from /api/contracts.counts).
-  // Total Documents bucket shows the ACTIVE count only (excluded rows are
-  // reported separately via `excluded`).  Kept in sync with state.allData
-  // by exclude/restore flows so a reload without a refetch stays correct.
-  populationCounts:   { active: 0, excluded: 0, total: 0 },
+  // `total` = active + excluded (matches the Total Documents bucket which
+  // shows every row on the master table).  `active` excludes rows with
+  // Excluded='Yes'.  Kept in sync with state.allData by exclude/restore
+  // flows so a reload without a refetch stays correct.
+  //
+  // Per-user workload-lock fields (populated when the session is
+  // authenticated — always true in production):
+  //   my_in_processing — how many of the overall in_processing rows
+  //                      were submitted by the logged-in user
+  //   my_active_total  — same, across every ACTIVE_MIGRATION_STATUSES
+  //                      value (identical today; future-proofed)
+  //   can_migrate      — bool; false → Migrate button MUST be disabled
+  //                      regardless of the user's row selection.
+  //                      Server enforces this too (409 on /api/migrate).
+  populationCounts:   { active: 0, excluded: 0, total: 0,
+                        my_in_processing: 0, my_active_total: 0,
+                        can_migrate: true },
+
+  // Migration destination configuration echoed by GET /api/contracts.
+  // Used ONLY by the Migrate-confirm modal to preview the real
+  // destination path (no secrets — just site/library/folder from the
+  // MIGRATION_DEST_* env vars).  Populated on Start; may be empty
+  // strings if the server hasn't been configured yet, in which case
+  // the modal falls back to a neutral "(destination not configured)"
+  // string instead of the old hardcoded "Wave2 destination/…".
+  migrationConfig:    { destSiteUrl: '', destLibrary: '', destFolderPath: '' },
 
   /* ── Folder navigator ──────────────────────────────────────────────────
    * Derived at load-time from row.sharePointPath and rebuilt whenever
@@ -603,6 +631,43 @@ function renderCell(row, col) {
     return `<span class="cell-clip" title="${esc(str)}">${esc(str)}</span>`;
   }
 
+  // ── Migration Status cell (rich) ─────────────────────────────────────
+  // Combines the UI bucket, the retry counter and the destination link
+  // into a single glanceable cell.  Everything is data-driven — no
+  // additional API calls from render time.
+  if (col.f === 'migrationStatus') {
+    const st        = rowStatus(row);        // Pending | In Processing | Migrated | Failed
+    const retryN    = Number(row.migrationRetryCount || 0);
+    const destUrl   = row.destinationUrl || '';
+    const errMsg    = row.errorMessage || '';
+    const migId     = row.migrationRequestId || '';
+    const backend   = row.migrationBackendStatus || '';
+
+    if (st === STATUS.MIGRATED) {
+      const link = destUrl
+        ? `<a class="cell-link migstatus-dest" href="${esc(destUrl)}" target="_blank" rel="noopener noreferrer" title="Open copied file: ${esc(destUrl)}">Open destination<span class="cell-link-icon">&#8599;</span></a>`
+        : '<span class="migstatus-note" title="Destination URL not yet reported by the platform">destination pending</span>';
+      return `<span class="migstatus-cell"><span class="status-badge status-migrate-yes">Migrated</span>${link}</span>`;
+    }
+    if (st === STATUS.IN_PROCESSING) {
+      const isRetrying = backend === 'retrying' || retryN > 0;
+      const badge = isRetrying
+        ? `<span class="status-badge status-in-processing" title="Backend is retrying — attempt ${retryN + 1}">Retrying${retryN ? ` (${retryN})` : ''}</span>`
+        : `<span class="status-badge status-in-processing">In Processing</span>`;
+      const tip = migId ? `Migration ID: ${migId}` : 'Awaiting platform';
+      return `<span class="migstatus-cell" title="${esc(tip)}">${badge}</span>`;
+    }
+    if (st === STATUS.FAILED) {
+      const badge = `<span class="status-badge status-failed">Failed</span>`;
+      const note = errMsg
+        ? `<span class="migstatus-note" title="${esc(errMsg)}">${esc(errMsg.length > 60 ? errMsg.slice(0, 60) + '…' : errMsg)}</span>`
+        : '';
+      return `<span class="migstatus-cell">${badge}${note}</span>`;
+    }
+    // Pending (default) — quiet cell to keep the column visually calm.
+    return '<span class="cell-empty">—</span>';
+  }
+
   if (col.f === 'missingFields' && str) {
     const parts = str.split(',').map(s => s.trim()).filter(Boolean);
     if (!parts.length) return '<span class="cell-empty">—</span>';
@@ -877,10 +942,50 @@ function updateToolbar() {
     if (row && isSelectable(row)) sel++;
   });
 
+  // Per-user workload lock: server-authoritative flag from /api/contracts
+  // and /api/migrations/sync.  When false, this user already has one or
+  // more rows in an active migration status they submitted, so we MUST
+  // disable Migrate regardless of selection.  Server enforces the same
+  // rule (returns 409 on /api/migrate) — this is a UX + latency
+  // optimisation, not the enforcement point.
+  const pc         = state.populationCounts || {};
+  const canMigrate = (pc.can_migrate !== false);   // default true if unknown
+  const myActive   = Number(pc.my_in_processing) || 0;
+
   const btn = $('migrate-btn');
-  btn.textContent = sel > 0 ? `Migrate (${sel})` : 'Migrate';
-  btn.disabled = sel === 0;
-  btn.className = `action-migrate-btn${sel > 0 ? ' active' : ''}`;
+  if (!canMigrate) {
+    btn.textContent = myActive > 0
+      ? `Migrate — ${myActive} of yours in processing`
+      : 'Migrate — batch in progress';
+    btn.disabled = true;
+    btn.className = 'action-migrate-btn locked';
+    btn.title = (
+      `You currently have ${myActive} file${myActive !== 1 ? 's' : ''} `
+      + `in processing.  New migrations can be submitted after your `
+      + `current batch completes.`
+    );
+  } else {
+    btn.textContent = sel > 0 ? `Migrate (${sel})` : 'Migrate';
+    btn.disabled = sel === 0;
+    btn.className = `action-migrate-btn${sel > 0 ? ' active' : ''}`;
+    btn.title = '';
+  }
+
+  // "My Active" indicator next to the selection counter.  Always
+  // reflects the same server-authoritative number the lock uses so
+  // users can see why their button is disabled at a glance.
+  const myInd = $('my-active-indicator');
+  if (myInd) {
+    if (myActive > 0) {
+      myInd.textContent = `My Active: ${myActive}`;
+      myInd.style.display = '';
+      myInd.classList.toggle('locked', !canMigrate);
+    } else {
+      myInd.textContent = '';
+      myInd.style.display = 'none';
+      myInd.classList.remove('locked');
+    }
+  }
 
   // Exclude button — enabled only when the selection includes at least one
   // Pending row.  Business rule §19: already-migrated documents AND
@@ -1049,17 +1154,41 @@ function updateBuckets() {
   // Failed rows are still eligible for retry, so they roll up into
   // "Yet to be Migrated" (B) — this preserves the A = B + C + D + E
   // identity and keeps every document in exactly one KPI bucket.
-  let migrated = 0, inProcessing = 0, yetToBeMigrated = 0;
-  state.allData.forEach(r => {
-    switch (rowStatus(r)) {
-      case STATUS.MIGRATED:       migrated++;         break;
-      case STATUS.IN_PROCESSING:  inProcessing++;     break;
-      // Pending + Failed → eligible for migration → "Yet to be Migrated".
-      default:                    yetToBeMigrated++;  break;
-    }
-  });
-  const excluded  = (typeof state.populationCounts.excluded === 'number')
-                      ? state.populationCounts.excluded
+  //
+  // Source-of-truth rule (live-refresh, added for task §17 follow-up):
+  //   When the sync poller has just written fresh counts from Azure SQL
+  //   into state.populationCounts, USE THOSE — they reflect the platform's
+  //   authoritative per-file result within the last 8 s.  Fall back to
+  //   the in-memory row scan only when server counts aren't available
+  //   yet (first paint before /api/contracts returns, or a legacy code
+  //   path that doesn't set populationCounts).  This makes the top-row
+  //   tiles decrement in lockstep with the row-status updates instead
+  //   of lagging behind until the next full table refresh.
+  const pc = state.populationCounts || {};
+  const hasServerCounts =
+        typeof pc.in_processing === 'number' &&
+        typeof pc.migrated      === 'number' &&
+        typeof pc.pending       === 'number';
+
+  let migrated, inProcessing, yetToBeMigrated;
+  if (hasServerCounts) {
+    migrated        = pc.migrated;
+    inProcessing    = pc.in_processing;
+    // "Yet to be Migrated" bundles Pending + Failed (both retry-eligible).
+    yetToBeMigrated = (pc.pending || 0) + (pc.failed || 0);
+  } else {
+    migrated = 0; inProcessing = 0; yetToBeMigrated = 0;
+    state.allData.forEach(r => {
+      switch (rowStatus(r)) {
+        case STATUS.MIGRATED:       migrated++;         break;
+        case STATUS.IN_PROCESSING:  inProcessing++;     break;
+        // Pending + Failed → eligible for migration → "Yet to be Migrated".
+        default:                    yetToBeMigrated++;  break;
+      }
+    });
+  }
+  const excluded  = (typeof pc.excluded === 'number')
+                      ? pc.excluded
                       : (state.excludedData.length || 0);
   // A = B + C + D + E  (Total Documents formula).
   const total = yetToBeMigrated + inProcessing + migrated + excluded;
@@ -1114,7 +1243,9 @@ function renderAll() {
   updateFooter();
   renderActiveFilters();
   updateBuckets();
-  renderFolderControl();
+  // renderFolderControl() removed with the "All Contracts" navigator.
+  // The remaining Folder Filter control renders itself via
+  // _syncFolderFilterButton() from its own handlers.
 }
 
 /* ── Folder control render (button label + breadcrumb bar) ────────────── */
@@ -1977,6 +2108,22 @@ function closeFolderFilterPanel() {
 
 /* ── Migration modal ────────────────────────────────────────────────────── */
 function openMigrateModal() {
+  // Per-user workload lock — belt-and-braces guard so a keyboard shortcut
+  // or programmatic click still can't open the modal while the user
+  // already has an active batch.  updateToolbar() disables #migrate-btn
+  // in this state, but the click handler runs regardless of button
+  // state on some browsers when triggered from code, and the server
+  // will 409 anyway.  This just short-circuits before the modal opens.
+  const pc = state.populationCounts || {};
+  if (pc.can_migrate === false) {
+    const n = Number(pc.my_in_processing) || 0;
+    showToast(
+      `You currently have ${n} file${n !== 1 ? 's' : ''} in processing. `
+      + `New migrations can be submitted after your current batch completes.`
+    );
+    return;
+  }
+
   // Only Pending / Failed (selectable) docs may actually be migrated.
   const eligible = [...state.selectedIds].filter(id => {
     const row = state.allData.find(r => r.fileID === id);
@@ -1985,26 +2132,66 @@ function openMigrateModal() {
   const n = eligible.length;
   if (n === 0) return;
 
+  // Group the selection by (source site, library, root-folder) tuple so
+  // the user sees exactly how many migration requests will be created
+  // and where every file is going.  Grouping mirrors the server's own
+  // logic in services.migration_platform.group_files_for_submission.
+  const groups = _summariseMigrateSelection(eligible);
+  const groupsHtml = groups.length
+    ? `<div class="migrate-groups">
+         ${groups.map(g => `
+           <div class="migrate-group">
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">From</span>
+               <span class="migrate-group-value" title="${_escapeHtml(g.sourceDisplay)}">${_escapeHtml(g.sourceDisplay)}</span>
+             </div>
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">To</span>
+               <span class="migrate-group-value" title="${_escapeHtml(g.destinationDisplay)}">${_escapeHtml(g.destinationDisplay)}</span>
+             </div>
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">Files</span>
+               <span class="migrate-group-value">${g.count}</span>
+             </div>
+           </div>`).join('')}
+       </div>`
+    : `<div class="migrate-groups migrate-groups-empty">
+         Unable to determine source folders for the selection. The server will
+         validate each file before submission.
+       </div>`;
+
+  const migrationCount = groups.length;
+  const migrationCountLabel = migrationCount === 1
+    ? '1 migration request'
+    : `${migrationCount} migration requests`;
+
   const html = `
     <div class="modal-overlay" id="modal-overlay">
-      <div class="modal">
+      <div class="modal modal-wide">
         <div class="modal-header">
-          <span class="modal-title">Confirm Migration</span>
+          <span class="modal-title">Confirm Copy to Destination</span>
         </div>
         <div class="modal-body">
-          <strong>${n}</strong> document${n !== 1 ? 's' : ''} will be sent to Power Automate for migration.
+          <p class="modal-lead">
+            <strong>${n}</strong> document${n !== 1 ? 's' : ''} will be <b>copied</b>
+            to the destination SharePoint via the Migration Platform
+            (${migrationCountLabel}).
+          </p>
+          ${groupsHtml}
           <div class="modal-note">
-            The selected document${n !== 1 ? 's' : ''} will be marked
-            <b>In Processing</b> and handed off to Power Automate, which copies
-            them to the destination SharePoint. On confirmed success each row
-            becomes <b>Migrated</b> with its <b>MigratedDate</b> set to the actual
-            completion time. Any that fail remain flagged as <b>Failed</b> —
-            they are not marked Migrated.
+            <b>What happens:</b> each selected document is submitted to the
+            Migration Platform, which copies it to the destination shown above.
+            Row status becomes <b>In Processing</b> immediately and updates to
+            <b>Migrated</b> once the copy is confirmed. Files that fail become
+            <b>Failed</b> — you can retry them later.
+            <br><br>
+            <b>Your source files are not modified or deleted</b> — this is a
+            one-way copy. Nothing is touched in the source SharePoint site.
           </div>
         </div>
         <div class="modal-footer">
           <button class="btn-cancel-modal" id="modal-cancel">Cancel</button>
-          <button class="btn-confirm-modal" id="modal-confirm">Confirm Migration</button>
+          <button class="btn-confirm-modal" id="modal-confirm">Copy to Destination</button>
         </div>
       </div>
     </div>`;
@@ -2022,25 +2209,119 @@ function openMigrateModal() {
   });
 }
 
+/**
+ * Group a set of selected FileIDs by their (site, library, root-folder)
+ * so the confirmation modal can preview exactly what will be submitted.
+ * Returns [{sourceDisplay, destinationDisplay, count}, ...].
+ * Rows whose SharePointPath cannot be parsed are lumped under a single
+ * "Unknown source" group so the user still sees them and can decide.
+ */
+function _summariseMigrateSelection(fileIds) {
+  const cfg = state.migrationConfig || {};
+  const destLibrary    = (cfg.destLibrary    || '').trim();
+  const destFolderPath = (cfg.destFolderPath || '').trim();
+  // Base destination prefix uses the real configured library + folder,
+  // mirroring services.migration_paths.build_destination_path().  When
+  // the server hasn't been configured, show a neutral placeholder so
+  // the user knows the preview isn't authoritative rather than seeing
+  // a stale "Wave2 destination/…" hardcoded string.
+  const destPrefix = destLibrary
+    ? `${destLibrary}${destFolderPath ? '/' + destFolderPath : ''}`
+    : '(destination not configured)';
+
+  const byGroup = new Map();
+  for (const fid of fileIds) {
+    const row = state.allData.find(r => r.fileID === fid);
+    if (!row) continue;
+    const parsed = _parseSharePointPathForPreview(row.sharePointPath);
+    const key = parsed
+      ? `${parsed.siteUrl}|${parsed.library}|${parsed.folderPath}`
+      : '__invalid__';
+    const g = byGroup.get(key) || {
+      sourceDisplay:      parsed
+        ? `${parsed.library}${parsed.folderPath ? '/' + parsed.folderPath : ''}`
+        : 'Unknown source (SharePoint path not recognised)',
+      destinationDisplay: parsed
+        ? (parsed.folderPath
+            ? `${destPrefix}/${parsed.folderPath}`
+            : `${destPrefix} (library root)`)
+        : '—',
+      count: 0,
+    };
+    g.count += 1;
+    byGroup.set(key, g);
+  }
+  return [...byGroup.values()];
+}
+
+/**
+ * Client-side approximation of services.migration_paths.parse_sharepoint_url.
+ * Used only for modal preview — the server re-parses authoritatively.
+ * Returns {siteUrl, library, folderPath} or null.
+ */
+function _parseSharePointPathForPreview(url) {
+  if (!url || typeof url !== 'string') return null;
+  const stripped = url.split('#')[0].split('?')[0].trim();
+  if (!/^https?:\/\//i.test(stripped)) return null;
+  let u;
+  try { u = new URL(stripped); } catch { return null; }
+  const segs = u.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  if (segs.length < 4 || segs[0].toLowerCase() !== 'sites') return null;
+  // Drop technical segments (Forms, AllItems.aspx) but keep the library name.
+  const cleaned = segs.slice(2).filter(s => !/^(forms|allitems\.aspx?)$/i.test(s));
+  if (cleaned.length < 2) return null;
+  return {
+    siteUrl:    `${u.protocol}//${u.host}/sites/${segs[1]}`,
+    library:    cleaned[0],
+    folderPath: cleaned.slice(1, -1).join('/'),
+  };
+}
+
+function _escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 /* ── Migration service ──────────────────────────────────────────────────────
- * Talks to POST /api/migrate which:
- *   1. Persists MigrationStatus='In Processing' for eligible FileIDs (§4).
- *   2. Triggers the Power Automate flow with the resulting batch.
- *   3a. SYNC: applies per-doc success/failure and returns them.
- *   3b. ASYNC: returns runId; results arrive later at /api/migrate/callback.
+ * Talks to POST /api/migrate which (post-platform-integration):
+ *   1. Persists MigrationStatus='In Processing' for eligible FileIDs.
+ *   2. Splits the eligible batch by (site, library, root-folder) tuple.
+ *   3. Per group: POST to the migration platform's /api/v1/migrations then
+ *      /api/v1/migrations/{id}/files/batch and persists the returned
+ *      MigrationRequestId + file_item IDs on our rows.
+ *   4. Groups whose platform call fails are rolled back to 'Failed';
+ *      successful groups stay In Processing until /api/migrations/sync
+ *      observes the terminal outcome.
  *
  * Response contract (all fields always present):
  *   {
- *     mode:         'sync' | 'async' | 'unconfigured' | 'error' | 'noop',
- *     runId:        string | null,
- *     inProcessing: string[],                    // ids persisted to In Processing
- *     migrated:     string[],                    // empty unless mode=sync
- *     failed:       Array<{fileID, error}>,      // populated in sync + error
- *     migratedAt:   string | null,
- *     skipped:      string[],                    // ids not eligible for phase 1
- *     error:        string | null
+ *     runId:               string | null,           // first migrationRequestId, back-compat
+ *     migrationRequestIds: string[],                // NEW canonical — one per group
+ *     inProcessing:        string[],                // ids persisted to In Processing
+ *     submitted:           { [migrationId]: string[] },  // per-migration file IDs
+ *     failed:              Array<{fileID, error}>,  // rolled back to Failed
+ *     skipped:             string[],                // not eligible for phase 1
+ *     invalid:             Array<{fileID, error}>,  // unparseable SharePointPath
+ *     groups:              Array<{migrationId, sourceSite, sourceLibrary,
+ *                                sourceFolder, fileCount, status, error}>,
+ *     error:               string | null
  *   }
  * ────────────────────────────────────────────────────────────────────────── */
+// Thrown by migrationService.migrate() when the server enforces the
+// per-user workload lock (409 with detail.reason='ACTIVE_MIGRATION_EXISTS').
+// performMigration() catches this specifically so we can show a friendly
+// message + refresh state.populationCounts from the response instead of
+// treating it as a generic network failure.
+class ActiveMigrationLockError extends Error {
+  constructor(activeCount, message) {
+    super(message || 'Active migration already in progress for your account.');
+    this.name          = 'ActiveMigrationLockError';
+    this.activeCount   = Number(activeCount) || 0;
+    this.reason        = 'ACTIVE_MIGRATION_EXISTS';
+  }
+}
+
 const migrationService = {
   async migrate(ids) {
     const res = await fetch('/api/migrate', {
@@ -2050,20 +2331,44 @@ const migrationService = {
     });
     if (!res.ok) {
       let msg = `HTTP ${res.status}`;
-      try { const j = await res.json(); if (j.detail) msg = j.detail; } catch {}
+      let detail = null;
+      try { const j = await res.json(); detail = j.detail; if (detail) msg = (typeof detail === 'string') ? detail : (detail.message || msg); } catch {}
+      // 409 + ACTIVE_MIGRATION_EXISTS → per-user workload lock hit.
+      // Server is the source of truth here: even if the client thought
+      // canMigrate was true (stale populationCounts), the server just
+      // told us otherwise.  Surface a typed error so the caller can
+      // rehydrate state + show the correct message.
+      if (res.status === 409 && detail && typeof detail === 'object'
+          && detail.reason === 'ACTIVE_MIGRATION_EXISTS') {
+        throw new ActiveMigrationLockError(detail.activeCount, detail.message);
+      }
       throw new Error(msg);
     }
     const json = await res.json();
     return {
-      mode:         json.mode || 'async',
-      runId:        json.runId || null,
-      inProcessing: Array.isArray(json.inProcessing) ? json.inProcessing : [],
-      migrated:     Array.isArray(json.migrated)     ? json.migrated     : [],
-      failed:       Array.isArray(json.failed)       ? json.failed       : [],
-      migratedAt:   json.migratedAt || null,
-      skipped:      Array.isArray(json.skipped)      ? json.skipped      : [],
-      error:        json.error || null,
+      runId:               json.runId || null,
+      migrationRequestIds: Array.isArray(json.migrationRequestIds) ? json.migrationRequestIds : [],
+      inProcessing:        Array.isArray(json.inProcessing) ? json.inProcessing : [],
+      submitted:           (json.submitted && typeof json.submitted === 'object') ? json.submitted : {},
+      failed:              Array.isArray(json.failed)  ? json.failed  : [],
+      skipped:             Array.isArray(json.skipped) ? json.skipped : [],
+      invalid:             Array.isArray(json.invalid) ? json.invalid : [],
+      groups:              Array.isArray(json.groups)  ? json.groups  : [],
+      error:               json.error || null,
     };
+  },
+  /** Poll every migration with any In Processing row and apply per-file
+   *  status deltas.  Returns:
+   *   { polled, updated, counts, errors }
+   *  where counts is the same shape /api/contracts returns. */
+  async sync() {
+    const res = await fetch('/api/migrations/sync', {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers:     { 'content-type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
   },
 };
 
@@ -2075,7 +2380,7 @@ function formatMigrationTimestamp(d) {
 }
 
 async function performMigration(ids) {
-  // Guard: only Pending/Failed rows may be sent (§15).
+  // Guard: only Pending/Failed rows may be sent.
   const eligibleIds = [...ids].filter(id => {
     const row = state.allData.find(r => r.fileID === id);
     return row && isSelectable(row);
@@ -2089,7 +2394,11 @@ async function performMigration(ids) {
   const btn = $('migrate-btn');
   const oldTxt = btn.textContent;
   btn.disabled = true;
-  btn.textContent = 'Migrating…';
+  btn.textContent = 'Submitting…';
+
+  // Show the live progress badge immediately so the click feels responsive
+  // (the /api/migrate round-trip can take 2–4s while groups are created).
+  migProgress.startSubmitting(eligibleIds.length);
 
   let result;
   try {
@@ -2097,73 +2406,249 @@ async function performMigration(ids) {
   } catch (err) {
     btn.disabled = false;
     btn.textContent = oldTxt;
-    showToast('Migration failed. Please try again.');
+    migProgress.hide();
+    // Per-user workload lock hit on the server.  Sync local state to
+    // match what the server just told us, re-render the button as
+    // locked, and show the exact message the server sent (which
+    // includes the accurate active count).  No files were flipped.
+    if (err && err.name === 'ActiveMigrationLockError') {
+      state.populationCounts = {
+        ...state.populationCounts,
+        my_in_processing: err.activeCount,
+        my_active_total:  err.activeCount,
+        can_migrate:      false,
+      };
+      applyFiltersAndSort();
+      renderAll();
+      showToast(err.message);
+      return;
+    }
+    showToast(`Could not submit to migration platform: ${err.message || err}`);
     return;
+  } finally {
+    // Always release the button — polling handles the rest of the lifecycle.
+    // updateToolbar() (called by renderAll below) will re-lock it if
+    // can_migrate came back false from /api/migrate's response.
+    btn.disabled = false;
+    btn.textContent = oldTxt;
   }
 
-  // ── Phase 1 (immediate): flip client-side rows to 'In Processing' ──
-  // The server has already persisted this transition; we mirror it in
-  // state.allData so the UI is honest without needing a refetch (§4).
+  // ── Mirror server state locally so the UI is honest without a refetch ──
+  // 1. Submitted rows → In Processing (server already persisted this).
   const inProcessingSet = new Set(result.inProcessing);
+  // 2. Failed-at-submit rows (platform 5xx, invalid path, group rollback)
+  //    → Failed.  Same set the server rolled back to Failed via
+  //    apply_migration_result().
+  const failedMap = new Map(result.failed.map(f => [f.fileID, f.error]));
+  const submittedByMigrationId = result.submitted || {};
+
   state.allData.forEach(r => {
     if (inProcessingSet.has(r.fileID)) {
       r.migrationStatus = STATUS.IN_PROCESSING;
-      // migrate flag NOT set to Yes — MigratedDate stays empty (§14).
-    }
-  });
-
-  // Documents that moved to In Processing must not stay in the selection
-  // (§13: they leave Pending immediately) and cannot be re-selected (§15).
-  inProcessingSet.forEach(id => state.selectedIds.delete(id));
-
-  // Phase 1 user feedback (§16).
-  const nIP = result.inProcessing.length;
-  if (nIP > 0) {
-    showToast(`${nIP} file${nIP !== 1 ? 's' : ''} moved to In Processing.`);
-  }
-
-  // ── Phase 2 outcome — depends on the flow mode ──
-  const migratedSet = new Set(result.migrated);
-  const failedMap   = new Map(result.failed.map(f => [f.fileID, f.error]));
-  const migratedAt  = toUsDateTime(result.migratedAt) || formatMigrationTimestamp(new Date());
-
-  state.allData.forEach(r => {
-    if (migratedSet.has(r.fileID)) {
-      r.migrationStatus = STATUS.MIGRATED;
-      r.migrate         = 'Yes';
-      r.migratedDate    = migratedAt;
+      // Stamp the migration_request_id on the row so the Status column
+      // can link to the migration detail.  Server will echo this back
+      // on the next /api/contracts refresh anyway.
+      for (const [mid, fids] of Object.entries(submittedByMigrationId)) {
+        if (fids.includes(r.fileID)) { r.migrationRequestId = mid; break; }
+      }
     } else if (failedMap.has(r.fileID)) {
       r.migrationStatus = STATUS.FAILED;
-      // Explicitly do NOT set r.migrate='Yes' and do NOT set migratedDate (§10).
+      r.errorMessage    = failedMap.get(r.fileID) || r.errorMessage || '';
     }
-    // Anything still in inProcessingSet that isn't in migrated/failed sets
-    // stays 'In Processing' — the async callback will resolve it later.
   });
+
+  // Submitted rows leave the selection immediately (they're no longer Pending).
+  inProcessingSet.forEach(id => state.selectedIds.delete(id));
+  failedMap.forEach((_e, id) => state.selectedIds.delete(id));
 
   applyFiltersAndSort();
   renderAll();
 
-  // Phase 2 user feedback (§16, §17).
-  if (result.mode === 'sync') {
-    const nOk = result.migrated.length;
-    const nBad = result.failed.length;
-    if (nBad > 0 && nOk > 0) {
-      showToast(`${nOk} file${nOk !== 1 ? 's' : ''} migrated successfully. ${nBad} failed.`);
-    } else if (nOk > 0) {
-      showToast(`${nOk} file${nOk !== 1 ? 's' : ''} migrated successfully.`);
-    } else if (nBad > 0) {
-      showToast(`Migration failed for ${nBad} file${nBad !== 1 ? 's' : ''}.`);
-    }
-  } else if (result.mode === 'error') {
-    // Server converted the trigger error into per-doc failures — surface that.
-    const nBad = result.failed.length;
-    showToast(`Migration could not start${result.error ? `: ${result.error}` : ''}. ${nBad} file${nBad !== 1 ? 's' : ''} marked as Failed.`);
-  } else if (result.mode === 'async' || result.mode === 'unconfigured') {
-    // Rows remain 'In Processing' pending the Power Automate callback.
-    // Toast already shown above for Phase 1 — nothing else to show.
-  } else if (result.mode === 'noop') {
-    showToast('No eligible documents to migrate.');
+  // ── User feedback ──
+  // Primary channel: the live progress badge (top-right).  It tracks the
+  // current cohort from Submitting → Migrating → Success / Partial / Failed
+  // and updates on every /api/migrations/sync tick.  This replaces the
+  // old "N files submitted (M migrations)" toast which users read as
+  // "M migrated" — see fix history 2026-09-22.
+  migProgress.onSubmitted(result);
+
+  // Secondary channel: short-lived toast for edge cases the badge does
+  // NOT surface (invalid SharePoint paths, already-processed rows).
+  const nInv  = result.invalid.length;
+  const nSkip = result.skipped.length;
+  const extraParts = [];
+  if (nInv  > 0) extraParts.push(`${nInv} rejected (bad SharePoint path)`);
+  if (nSkip > 0) extraParts.push(`${nSkip} skipped (already processed)`);
+  if (extraParts.length > 0) showToast(extraParts.join(' · '));
+
+  // ── Kick the poller — it will refresh counts + row statuses every
+  // MIG_POLL_INTERVAL_MS (see below) until in_processing hits 0.  Safe
+  // to call while already running (idempotent via a timer-not-null
+  // guard inside migrationPoller.start).
+  //
+  // We start the poller whenever ANY row was flipped to In Processing
+  // by /api/migrate — the server has now committed those rows and the
+  // background submission is running.  The very first poll tick fires
+  // immediately (see start()) so counts refresh within ~200ms of the
+  // click, without waiting for the full interval.
+  if (inProcessingSet.size > 0) {
+    migrationPoller.start();
   }
+}
+
+/* ── Migration status poller ───────────────────────────────────────────────
+ * When any row is In Processing, poll /api/migrations/sync every 15s so
+ * the UI reflects the platform's authoritative state without the user
+ * having to reload.  The poller:
+ *   * self-throttles (idempotent — repeated .start() calls are no-ops),
+ *   * hides itself when in_processing hits 0,
+ *   * refetches /api/contracts opportunistically when the sync reports
+ *     any row-level updates so the actual row.migrationStatus values,
+ *     destination URLs, retry counts etc. reflect the latest DB state,
+ *   * survives a browser refresh via start-on-load in enterReviewScreen(),
+ *   * bails out and stops on repeated errors (max 5 in a row) so a broken
+ *     platform doesn't spam the network forever.
+ * ────────────────────────────────────────────────────────────────────────── */
+const migrationPoller = (function () {
+  // 8s — inside the 5–10s band the product team specified.  Faster than
+  // the previous 15s so live "Remaining N/M" counts feel responsive
+  // without hammering the platform or Azure SQL.  Adjustable at the
+  // module level; the browser never reads a server-provided interval.
+  const INTERVAL_MS = 8_000;
+  const MAX_CONSECUTIVE_ERRORS = 5;
+  // Timer handle — non-null means a poll cycle is scheduled.  The
+  // start() guard `if (timer) return` prevents two concurrent timers
+  // even if start() is called from multiple code paths (Migrate click,
+  // enterReviewScreen resume, page-refresh recovery).
+  let timer = null;
+  let inFlight = false;
+  let consecutiveErrors = 0;
+
+  async function tick() {
+    if (inFlight) return;               // avoid overlap on slow networks
+    inFlight = true;
+    try {
+      const res = await migrationService.sync();
+      consecutiveErrors = 0;
+
+      // Update the KPI-bar counts immediately (cheap, no refetch needed).
+      if (res.counts && typeof res.counts === 'object') {
+        state.populationCounts = {
+          ...state.populationCounts,
+          active:        Number(res.counts.active)        || state.populationCounts.active,
+          excluded:      Number(res.counts.excluded)      || state.populationCounts.excluded,
+          total:         Number(res.counts.total)         || state.populationCounts.total,
+          pending:       Number(res.counts.pending)       || 0,
+          in_processing: Number(res.counts.in_processing) || 0,
+          migrated:      Number(res.counts.migrated)      || 0,
+          failed:        Number(res.counts.failed)        || 0,
+          // Per-user workload-lock fields — server includes these
+          // whenever the session is authenticated.  When they arrive we
+          // trust them absolutely: this is the mechanism that
+          // auto-unlocks the Migrate button as the user's rows complete
+          // (my_in_processing goes 50 → 42 → 30 → … → 0 → can_migrate
+          // flips true → next renderAll enables the button).
+          my_in_processing: Number(res.counts.my_in_processing) || 0,
+          my_active_total:  Number(res.counts.my_active_total)  || 0,
+          can_migrate:      (res.counts.can_migrate !== false),
+        };
+      }
+
+      // Always refresh the actual row data on every tick — the user
+      // asked for live per-file decrement (one file completes → tile
+      // drops from 10 to 9 to 8 …).  Refreshing only on transitions
+      // meant the table could lag the tiles by one tick when the
+      // server's counts already showed the drop.  /api/contracts is
+      // cheap (single indexed read of ~641 rows) and the poller only
+      // runs while in_processing > 0, so this is bounded work.
+      const anyUpdated = res.updated && (
+        (res.updated.migrated || 0) +
+        (res.updated.failed || 0) +
+        (res.updated.skipped || 0) +
+        (res.updated.in_processing || 0)
+      ) > 0;
+      if (anyUpdated) {
+        // Row-level changes happened — pull fresh rows so Status column,
+        // destination URL, retry count, error message all reflect DB.
+        await refreshContractRows();
+      } else {
+        // Nothing changed row-wise but counts (and now Failed bucket)
+        // may still have — re-render tiles from state.populationCounts
+        // which the block above just refreshed from the sync response.
+        renderAll();
+      }
+
+      // Update the live progress badge (top-right) so the user sees
+      // cohort-level progress even between full-table refreshes.  Runs
+      // AFTER refreshContractRows() so state.allData holds the freshest
+      // per-row migrationStatus.
+      migProgress.tick();
+
+      // Stop when nothing is in flight anymore.
+      if ((state.populationCounts.in_processing || 0) === 0) {
+        stop();
+      }
+    } catch (err) {
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        showToast('Migration status updates paused — the platform is not reachable. Reload the page to retry.');
+        stop();
+      }
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  function start() {
+    if (timer) return;                  // idempotent
+    // Fire once immediately so the user sees updates without waiting.
+    tick();
+    timer = setInterval(tick, INTERVAL_MS);
+  }
+
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    consecutiveErrors = 0;
+  }
+
+  function isRunning() { return timer != null; }
+
+  return { start, stop, isRunning, _tick: tick };
+})();
+
+/** Re-fetch /api/contracts and merge into state.allData.  Used by the
+ *  poller when the sync reports row-level updates so the UI reflects the
+ *  DB (destination URL, retry count, error message, etc.) without the
+ *  user having to reload the page. */
+async function refreshContractRows() {
+  const res = await fetch('/api/contracts',
+                          { cache: 'no-store', credentials: 'same-origin' });
+  if (res.status === 401) { window.location.assign('/login'); return; }
+  if (!res.ok) return;
+  const json = await res.json();
+  const rows = Array.isArray(json.data) ? json.data : [];
+  // Merge by fileID so we don't lose any client-side ephemeral flags.
+  const byId = new Map(state.allData.map(r => [r.fileID, r]));
+  rows.forEach(r => {
+    const merged = {
+      ...byId.get(r.fileID),
+      ...r,
+      migrate:         (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
+      migratedDate:    r.migratedDate || '',
+      migrationStatus: r.migrationStatus
+                       || (r.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
+    };
+    byId.set(r.fileID, normaliseDatesInRow(merged));
+  });
+  state.allData = [...byId.values()];
+  if (json.counts) {
+    state.populationCounts = {
+      ...state.populationCounts,
+      ...json.counts,
+    };
+  }
+  applyFiltersAndSort();
+  renderAll();
 }
 
 /* ── Exclusion (soft-delete) ───────────────────────────────────────────────
@@ -2699,6 +3184,51 @@ function showToast(msg) {
   setTimeout(() => t.remove(), 3500);
 }
 
+/* ── Live migration progress badge ─────────────────────────────────────────
+ *
+ * Sticky pill top-right that follows a single submission cohort from
+ * click → completion.  Replaces the misleading "N files submitted
+ * (M migrations)" toast which users read as "M migrated".
+ *
+ * Cohort = the set of FileIDs returned in the /api/migrate `inProcessing`
+ * array PLUS any that failed at submit.  We do NOT track background
+ * migrations kicked off by other users / earlier sessions — those still
+ * flow through the KPI counters normally.
+ *
+ * States (single-line title, styled left border):
+ *   submitting  ⟳  "Submitting N files…"
+ *   progress    ⟳  "Migrating N files"    sub: "X done · Y in progress · Z failed"
+ *   success     ✓  "N of N files migrated"
+ *   partial     ⚠  "X done · Y failed of N"
+ *   failed      ✕  "All N files failed to migrate"
+ *
+ * Auto-hide: success → fades after 8s; partial/failed stay sticky with ×.
+ * A brand-new click while a badge is showing resets it to the new cohort.
+ * ─────────────────────────────────────────────────────────────────────── */
+const migProgress = (() => {
+  // Live migration-progress pill was removed at user request.  All public
+  // methods are retained as no-ops so existing call sites (Migrate button,
+  // /api/migrations/sync poller) continue to work without any changes.
+  //
+  // Row-level statuses in the main table (Pending → In Processing → Migrated
+  // / Failed) are still updated by the sync poller as usual — only the
+  // top-right floating pill has been suppressed.
+  //
+  // Belt-and-braces: also force-hide the pill element in the DOM in case a
+  // previous session left the `is-visible` class on it.
+  document.addEventListener('DOMContentLoaded', () => {
+    const e = document.getElementById('mig-progress');
+    if (e) e.classList.remove('is-visible');
+  });
+
+  function startSubmitting(_nFiles) { /* no-op */ }
+  function onSubmitted(_result)     { /* no-op */ }
+  function tick()                   { /* no-op */ }
+  function hide()                   { /* no-op */ }
+
+  return { startSubmitting, onSubmitted, tick, hide };
+})();
+
 /* ── Screen management ─────────────────────────────────────────────────── */
 function showScreen(name) {
   $('screen-source').style.display = name === 'source' ? 'flex' : 'none';
@@ -2745,6 +3275,13 @@ function enterReviewScreen() {
   showScreen('review');
   $('table-root').closest('.table-container').style.display = '';
   renderAll();
+
+  // Resume polling if we landed on a page where files are already In
+  // Processing (browser refresh mid-migration, or another user submitted
+  // some rows earlier).  Poller is idempotent so double-calling is safe.
+  if ((state.populationCounts.in_processing || 0) > 0) {
+    migrationPoller.start();
+  }
 }
 
 function initSourceScreen() {
@@ -2776,6 +3313,16 @@ function initSourceScreen() {
       state.sourceData  = Array.isArray(json.data) ? json.data : [];
       state.sourceCount = typeof json.total === 'number' ? json.total : state.sourceData.length;
 
+      // Capture destination config for the Migrate-confirm modal preview.
+      // Server echoes MIGRATION_DEST_* env vars — no secrets included.
+      if (json.config && typeof json.config === 'object') {
+        state.migrationConfig = {
+          destSiteUrl:    String(json.config.destSiteUrl    || ''),
+          destLibrary:    String(json.config.destLibrary    || ''),
+          destFolderPath: String(json.config.destFolderPath || ''),
+        };
+      }
+
       // Capture server-authoritative population counts so the Manual Review
       // KPI buckets reflect the *entire* population (active + excluded).
       if (json.counts && typeof json.counts === 'object') {
@@ -2787,6 +3334,13 @@ function initSourceScreen() {
           in_processing: Number(json.counts.in_processing) || 0,
           migrated:      Number(json.counts.migrated)      || 0,
           failed:        Number(json.counts.failed)        || 0,
+          // Per-user workload-lock fields (task 2026-09-24).  Present
+          // on every authenticated /api/contracts response — used to
+          // paint the correct Migrate button state on first render
+          // WITHOUT waiting for the sync poller's first tick.
+          my_in_processing: Number(json.counts.my_in_processing) || 0,
+          my_active_total:  Number(json.counts.my_active_total)  || 0,
+          can_migrate:      (json.counts.can_migrate !== false),
         };
       } else {
         state.populationCounts = {
@@ -2797,6 +3351,9 @@ function initSourceScreen() {
           in_processing: 0,
           migrated:      0,
           failed:        0,
+          my_in_processing: 0,
+          my_active_total:  0,
+          can_migrate:      true,
         };
       }
 
@@ -2816,10 +3373,25 @@ function initSourceScreen() {
 }
 
 /* ── CSV Export ─────────────────────────────────────────────────────────
- * Exports state.filteredData (i.e. the current search/filter/bucket result
- * set — NOT the current page) as a real .csv file.  Excel-safe escaping:
- * fields containing ", commas, or newlines are wrapped in "…" with any
- * embedded quotes doubled per RFC 4180.
+ * Exports whichever dataset the user is currently looking at:
+ *
+ *   currentView = 'review'   → state.filteredData
+ *                               = state.allData
+ *                                 ↓ folder scope + folder filter
+ *                                 ↓ bucket filter (all / pending /
+ *                                                   in_processing /
+ *                                                   migrated / selected)
+ *                                 ↓ global search
+ *                                 ↓ column filters
+ *                                 ↓ current sort
+ *   currentView = 'excluded' → state.excludedData   (the excluded bucket)
+ *
+ * This is the SAME dataset applyFiltersAndSort() feeds the table, so what
+ * the user sees on-screen and what lands in the CSV always match.  It is
+ * NOT the current page — the whole matching dataset is exported.
+ *
+ * Excel-safe escaping (RFC 4180): fields containing ", commas or newlines
+ * are wrapped in "…" with embedded quotes doubled.
  * ─────────────────────────────────────────────────────────────────────── */
 function csvEscape(v) {
   if (v === null || v === undefined) return '';
@@ -2828,8 +3400,74 @@ function csvEscape(v) {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-function exportCsv() {
-  const rows = state.filteredData || [];
+// Human-readable slug for the CSV filename, derived from whichever bucket
+// the user has selected.  Kept in sync with the tile labels in index.html.
+function _bucketSlugForExport() {
+  if (state.currentView === 'excluded') return 'excluded';
+  switch (state.bucketFilter) {
+    case 'migrated':      return 'migrated';
+    case 'in_processing': return 'in_processing';
+    case 'pending':       return 'yet_to_be_migrated';
+    case 'selected':      return 'selected';
+    case 'all':
+    default:              return 'all';
+  }
+}
+
+async function exportCsv() {
+  // Pick the dataset the user is currently looking at.  Three cases:
+  //
+  //   1. Excluded view          → state.excludedData (all excluded rows).
+  //   2. Review, bucket=all     → server union of active + excluded
+  //                               (fetched on demand with
+  //                               include_excluded=1) so the Total
+  //                               Documents export actually contains
+  //                               every row on the master inventory,
+  //                               not just the active subset the review
+  //                               grid renders.  Current search + folder
+  //                               scope + column filters are re-applied
+  //                               to the union so the exported set still
+  //                               reflects the user's UI state.
+  //   3. Review, other buckets  → state.filteredData (already correct —
+  //                               Pending / In Processing / Migrated
+  //                               are all subsets of the active set).
+  let rows;
+  if (state.currentView === 'excluded') {
+    rows = state.excludedData || [];
+  } else if (state.bucketFilter === 'all') {
+    try {
+      const res = await fetch('/api/contracts?include_excluded=1',
+                              { cache: 'no-store', credentials: 'same-origin' });
+      if (res.status === 401) { window.location.assign('/login'); return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const fetched = Array.isArray(json.data) ? json.data : [];
+      // Re-apply the user's current filters (folder scope, folder filter,
+      // global search, column filters, sort) to the union by temporarily
+      // swapping state.allData through applyFiltersAndSort().  We restore
+      // it (and state.filteredData / state.page) immediately so no render
+      // is triggered against the swapped set.
+      const savedAll      = state.allData;
+      const savedFiltered = state.filteredData;
+      const savedPage     = state.page;
+      try {
+        state.allData = fetched.map(r => normaliseDatesInRow({ ...r }));
+        applyFiltersAndSort();
+        rows = state.filteredData || [];
+      } finally {
+        state.allData      = savedAll;
+        state.filteredData = savedFiltered;
+        state.page         = savedPage;
+      }
+    } catch (err) {
+      console.error('Total export fetch failed:', err);
+      showToast('Export failed — could not fetch full inventory.');
+      return;
+    }
+  } else {
+    rows = state.filteredData || [];
+  }
+
   // Use ALL configured data columns (not just currently visible) so the export
   // is a complete record, and always in a stable order.  Skips UI-only fields
   // like row-number and checkbox (those aren't in COL_CFG).
@@ -2844,9 +3482,16 @@ function exportCsv() {
   const csv  = '\uFEFF' + header + '\r\n' + body;
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
 
+  // Filename reflects the currently-selected bucket per manager spec:
+  //   contract_inventory_all.csv
+  //   contract_inventory_yet_to_be_migrated.csv
+  //   contract_inventory_in_processing.csv
+  //   contract_inventory_migrated.csv
+  //   contract_inventory_excluded.csv
+  // Timestamp appended (existing behaviour) so multiple exports don't clash.
   const d = new Date();
   const stamp = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  const filename = `contract_migration_review_${stamp}.csv`;
+  const filename = `contract_inventory_${_bucketSlugForExport()}_${stamp}.csv`;
 
   const url  = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -2896,15 +3541,16 @@ function initReviewEventListeners() {
   $('migrate-btn').addEventListener('click', openMigrateModal);
   $('exclude-btn').addEventListener('click', openExcludeModal);
   $('export-csv-btn').addEventListener('click', exportCsv);
-  // Folder browser button — toggles the compact folder dropdown.
-  const folderBtn = $('folder-btn');
-  if (folderBtn) folderBtn.addEventListener('click', e => {
-    e.stopPropagation();
-    if (document.getElementById('folder-panel')) closeFolderPanel();
-    else openFolderPanel();
-  });
-  // Global folder filter (Philippe requirement) — separate from the folder
-  // navigator above; searches Folder 1..20 across the entire inventory.
+  // Same handler for the Export CSV button in the Excluded view header.
+  // exportCsv() inspects state.currentView and exports state.excludedData
+  // when the user is looking at Excluded — so "Excluded selected → export
+  // only excluded records" works without a second export implementation.
+  const exclExportBtn = $('excluded-export-csv-btn');
+  if (exclExportBtn) exclExportBtn.addEventListener('click', exportCsv);
+  // (Removed) "All Contracts" folder navigator button + dropdown wiring —
+  // the hierarchical folder browser was retired per manager request.
+  // Global folder filter (Philippe requirement) — searches Folder 1..20
+  // across the entire inventory.
   const folderFilterBtn = $('folder-filter-btn');
   if (folderFilterBtn) folderFilterBtn.addEventListener('click', e => {
     e.stopPropagation();
@@ -2912,14 +3558,11 @@ function initReviewEventListeners() {
     else openFolderFilterPanel();
   });
 
-  // Restore + back-to-review buttons (Excluded view)
+  // Restore button (Excluded view).  Users return to the active list by
+  // clicking any non-Excluded bucket (Total / Pending / In Processing /
+  // Migrated) in the header — no dedicated back button.
   const restoreBtn = $('restore-btn');
   if (restoreBtn) restoreBtn.addEventListener('click', openRestoreModal);
-  const backBtn = $('excluded-back-btn');
-  if (backBtn) backBtn.addEventListener('click', () => {
-    // Return to review with the current bucket filter untouched.
-    showReviewView();
-  });
 
   // Summary bucket clicks — apply migration-status filter over the dataset.
   // The Excluded bucket is special: it switches to a separate view instead

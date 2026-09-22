@@ -11,6 +11,7 @@ from routes import auth as auth_router
 from routes import contracts as contracts_router
 from routes.auth import require_session
 from services import auth_service
+from services import migration_platform_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +52,13 @@ async def login_page(request: Request):
     sid = request.cookies.get(settings.APP_SESSION_COOKIE)
     if sid and auth_service.get_session(sid):
         return RedirectResponse(url="/", status_code=302)
-    return templates.TemplateResponse("login.html", {"request": request})
+    # Use the new keyword-based TemplateResponse signature (Starlette >= 0.29).
+    # Passing `request` positionally as the first argument is required in
+    # newer Starlette releases; the old (name, context) form still works via
+    # kwargs on 0.38.x but is deprecated and breaks on some Azure images.
+    return templates.TemplateResponse(
+        request=request, name="login.html", context={}
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -61,4 +68,19 @@ async def index(request: Request):
     sid = request.cookies.get(settings.APP_SESSION_COOKIE)
     if not sid or not auth_service.get_session(sid):
         return RedirectResponse(url="/login", status_code=302)
-    return templates.TemplateResponse("index.html", {"request": request})
+    # Same keyword-based signature — see /login handler above.
+    return templates.TemplateResponse(
+        request=request, name="index.html", context={}
+    )
+
+
+# ── Lifecycle hooks ─────────────────────────────────────────────────────
+@app.on_event("shutdown")
+def _shutdown_close_db_pool() -> None:
+    """Close the migration-platform PostgreSQL connection pool cleanly on
+    process shutdown so sockets are returned instead of GC'd."""
+    try:
+        migration_platform_db.close_pool()
+    except Exception:
+        # Never let a pool-close failure hide a real shutdown error.
+        logging.getLogger(__name__).exception("close_pool during shutdown failed")

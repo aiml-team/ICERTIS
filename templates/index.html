@@ -104,16 +104,11 @@
         <div id="col-btn-wrap" class="col-btn-wrap">
           <button class="tb-btn" id="col-btn">Columns &#9660;</button>
         </div>
-        <!-- Folder browser: hierarchical navigator built from sharePointPath.
-             Opens a compact dropdown with the current folder's direct children;
-             breadcrumb below the toolbar shows/edits the active folder path. -->
-        <div id="folder-btn-wrap" class="col-btn-wrap">
-          <button class="tb-btn" id="folder-btn" type="button" title="Browse folders">
-            <span class="folder-btn-icon" aria-hidden="true">&#128193;</span>
-            <span id="folder-btn-label">All Contracts</span>
-            <span aria-hidden="true">&#9660;</span>
-          </button>
-        </div>
+        <!-- (Removed) "All Contracts" folder navigator — the hierarchical
+             folder dropdown was retired per manager request.  The Folder
+             Filter button below remains the sole folder-based control on
+             this page.  Folder columns (Folder 1..20) in the DB and the
+             SharePoint path metadata are untouched. -->
         <!-- Global folder filter (Philippe requirement): searches Folder 1..20
              across the ENTIRE inventory, regardless of the folder navigator's
              current scope.  Opens a popover with text + match-mode + Apply. -->
@@ -134,10 +129,8 @@
       </div>
     </div>
 
-    <!-- Folder breadcrumb — visible whenever any folder is selected below the
-         virtual root.  Each segment is clickable; last segment is the current
-         folder.  Hidden entirely when scope = All Contracts (root). -->
-    <div class="folder-crumb" id="folder-crumb" style="display:none"></div>
+    <!-- (Removed) Folder breadcrumb — companion to the retired "All
+         Contracts" folder navigator. -->
 
     <!-- Active filter chips -->
     <div class="af-bar" id="af-bar" style="display:none"></div>
@@ -161,6 +154,14 @@
         <button class="action-exclude-btn" id="exclude-btn" type="button" disabled title="Exclude selected files from the migration review list (recoverable)">Exclude</button>
         <span class="action-sel-count" id="sel-count">No files selected</span>
         <button class="action-migrate-btn" id="migrate-btn" disabled>Migrate</button>
+        <!-- Per-user workload lock indicator (task 2026-09-24).  Populated
+             by updateToolbar() from state.populationCounts.my_in_processing.
+             Hidden entirely when the logged-in user has no active rows —
+             the overall In Processing bucket at the top of the page
+             continues to show the app-wide number.  Compact by design:
+             sits next to Migrate so the reason the button is disabled is
+             adjacent to the button itself. -->
+        <span class="action-my-active" id="my-active-indicator" style="display:none" title="How many of the overall In Processing rows were submitted by you"></span>
       </div>
       <div class="pager" id="pager"></div>
     </div>
@@ -174,7 +175,13 @@
           <h2 class="excluded-title">Excluded Documents</h2>
           <span class="excluded-sub" id="excluded-sub">These documents have been excluded from the migration review list. They are not deleted and can be restored.</span>
         </div>
-        <button class="tb-btn excluded-back-btn" id="excluded-back-btn" type="button" title="Return to the active Manual Review list">&#8592; Back to Manual Review</button>
+        <!-- Export CSV for the Excluded bucket.  Same handler as the review-view
+             button; exportCsv() branches on state.currentView so this exports
+             state.excludedData (the full excluded set, not the current page). -->
+        <button class="tb-btn tb-export-btn" id="excluded-export-csv-btn" type="button" title="Export all excluded documents as CSV">
+          <span class="tb-export-icon" aria-hidden="true">&#8681;</span>
+          Export CSV
+        </button>
       </div>
 
       <div class="grid-wrap">
@@ -196,6 +203,18 @@
   </div><!-- /screen-review -->
 
 </div>
+
+<!-- Live migration progress badge (hidden until user clicks Migrate). -->
+<div id="mig-progress" class="mig-progress" role="status" aria-live="polite">
+  <span class="mp-icon" id="mp-icon">⟳</span>
+  <div class="mp-body">
+    <div class="mp-title" id="mp-title">Submitting…</div>
+    <div class="mp-sub" id="mp-sub"></div>
+    <div class="mp-bar"><div class="mp-bar-fill" id="mp-bar-fill"></div></div>
+  </div>
+  <button type="button" class="mp-close" id="mp-close" title="Dismiss">×</button>
+</div>
+
 <script src="/static/js/app.js"></script>
 </body>
 </html>

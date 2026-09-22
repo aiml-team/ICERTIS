@@ -28,38 +28,77 @@ class Settings:
     # ── Application ──────────────────────────────────────────────────────
     CONTRACT_TABLE: str = os.getenv("CONTRACT_TABLE", "ContractInventory")
 
-    # ── Power Automate migration flow ────────────────────────────────────
-    # The URL is the HTTP trigger of a Power Automate cloud flow that
-    # copies a batch of documents from the source SharePoint site into
-    # the destination.  If unset, the /api/migrate endpoint still moves
-    # rows to 'In Processing' but does NOT auto-complete them — a later
-    # webhook / callback can post per-doc results to /api/migrate/callback.
+    # ── SharePoint File Migration Platform integration ───────────────────
+    # This application NO LONGER calls Power Automate directly.  The
+    # dedicated migration platform (deployed to Azure Container Apps —
+    # see SharePoint_Migration_Platform_Technical_Handover.docx) owns:
+    #   orchestration, dispatch, Power Automate call, callbacks,
+    #   retry logic, audit trail, idempotency, per-file status.
     #
-    # POWER_AUTOMATE_URL      full trigger URL (may include signature/SAS)
-    # POWER_AUTOMATE_TIMEOUT  request timeout in seconds (default 60)
-    # POWER_AUTOMATE_SYNC     "1" if the flow returns per-doc results in
-    #                         the response body (synchronous); "0" if it
-    #                         only starts a long-running job (default 0)
-    # POWER_AUTOMATE_API_KEY  optional bearer/API key (sent as
-    #                         "Authorization: Bearer <key>" when present)
+    # This app only:
+    #   1. Creates a migration via POST {base}/api/v1/migrations
+    #   2. Adds files via   POST {base}/api/v1/migrations/{id}/files/batch
+    #   3. Polls status via GET  {base}/api/v1/migrations/{id}
+    #                        + GET {base}/api/v1/migrations/{id}/files/status-counts
+    #   4. Fetches audit on demand via
+    #        GET {base}/api/v1/migrations/{id}/audit
+    #
+    # MIGRATION_API_BASE_URL   root of the deployed platform (no trailing /)
+    # MIGRATION_API_TIMEOUT    HTTP timeout seconds per call (default 30)
+    # MIGRATION_POLL_INTERVAL  browser poll interval in seconds while any
+    #                          rows are 'In Processing' (default 15)
+    # MIGRATION_DEFAULT_PRIORITY  request priority 0..5 (default 3)
+    # MIGRATION_NAME_PREFIX    prepended to auto-generated migration names
+    MIGRATION_API_BASE_URL:  str = os.getenv("MIGRATION_API_BASE_URL", "").rstrip("/")
+    MIGRATION_API_TIMEOUT:   int = int(os.getenv("MIGRATION_API_TIMEOUT", "30"))
+    MIGRATION_POLL_INTERVAL: int = int(os.getenv("MIGRATION_POLL_INTERVAL_SECONDS", "15"))
+    MIGRATION_DEFAULT_PRIORITY: int = int(os.getenv("MIGRATION_DEFAULT_PRIORITY", "3"))
+    MIGRATION_NAME_PREFIX:   str = os.getenv("MIGRATION_NAME_PREFIX", "Wave2")
+
+    # ── Destination SharePoint configuration ─────────────────────────────
+    # These end up as destination_site_url / destination_library /
+    # destination_folder_path on the migration request payload
+    # (handover §5.1).  TODO: set real values in .env before running
+    # against the deployed migration platform.
+    MIGRATION_DEST_SITE_URL:    str = os.getenv("MIGRATION_DEST_SITE_URL", "")
+    MIGRATION_DEST_LIBRARY:     str = os.getenv("MIGRATION_DEST_LIBRARY", "Documents")
+    MIGRATION_DEST_FOLDER_PATH: str = os.getenv("MIGRATION_DEST_FOLDER_PATH", "Wave2")
+
+    # ── Migration platform PostgreSQL (direct-read fallback) ─────────────
+    # When the platform HTTP API is temporarily unreachable, /api/migrations/sync
+    # falls back to reading per-file status directly from the platform's
+    # PostgreSQL DB (READ-ONLY — we never write to it).  Set MIGRATION_DB_URL
+    # to a valid postgresql:// DSN to enable; leave blank to disable the
+    # fallback entirely (sync then works exactly as before).
+    #
+    # Handover doc: DATABASE_REFERENCE.md §1.  Password comes from
+    # .azure-secrets.local (PG_PASSWORD) — never hard-code.
+    MIGRATION_DB_URL:              str = os.getenv("MIGRATION_DB_URL", "")
+    MIGRATION_DB_CONNECT_TIMEOUT:  int = int(os.getenv("MIGRATION_DB_CONNECT_TIMEOUT", "10"))
+
+    # ── Legacy Power Automate settings — DEPRECATED ──────────────────────
+    # Kept only so old .env files do not break process startup.  The
+    # POST /api/migrate route no longer reads these; all migration
+    # dispatch goes through MigrationPlatformService.  Remove after
+    # everyone has migrated their .env files.
     POWER_AUTOMATE_URL:     str  = os.getenv("POWER_AUTOMATE_URL", "")
     POWER_AUTOMATE_TIMEOUT: int  = int(os.getenv("POWER_AUTOMATE_TIMEOUT", "60"))
     POWER_AUTOMATE_SYNC:    bool = os.getenv("POWER_AUTOMATE_SYNC", "0") == "1"
     POWER_AUTOMATE_API_KEY: str  = os.getenv("POWER_AUTOMATE_API_KEY", "")
 
-    # ── Lightweight shared-password login ────────────────────────────────
+    # ── Lightweight email-only login ─────────────────────────────────────
     # This is NOT an authentication system — it exists only to identify
     # the current user (by company email) and separate concurrent sessions
     # so future migration actions can record `StartedBy` / `SessionId`.
     #
-    # APP_SHARED_PASSWORD   the one password every user types (default
-    #                       "AIML@2025"; override in .env for production)
+    # Password-based login was removed at product request — the previous
+    # APP_SHARED_PASSWORD variable is no longer read.
+    #
     # APP_COMPANY_DOMAIN    the ONLY email domain accepted at login
     #                       (case-insensitive exact match, no subdomains)
     # APP_SESSION_COOKIE    HttpOnly cookie name that carries the session id
     # APP_SESSION_TTL_HOURS session lifetime; expired sessions redirect to
     #                       the login page (default 12h)
-    APP_SHARED_PASSWORD:   str = os.getenv("APP_SHARED_PASSWORD", "AIML@2026")
     APP_COMPANY_DOMAIN:    str = os.getenv("APP_COMPANY_DOMAIN", "bs.nttdata.com")
     APP_SESSION_COOKIE:    str = os.getenv("APP_SESSION_COOKIE", "cmr_session")
     APP_SESSION_TTL_HOURS: int = int(os.getenv("APP_SESSION_TTL_HOURS", "12"))

@@ -1,17 +1,33 @@
 """Contract data service — Azure SQL backed.
 
 Public API:
-    load_contracts()                       -> List[dict]   (active records)
-    load_excluded()                        -> List[dict]   (excluded records)
-    count_all()                            -> dict         ({active, excluded, total})
-    mark_migrated(ids, migrated_at)        -> dict         (rows updated)
-    mark_excluded(ids)                     -> dict         (rows MOVED to excluded table)
-    restore_excluded(ids)                  -> dict         (rows MOVED back to active)
+    load_contracts(include_excluded=False) -> List[dict]   (all inventory)
+    load_excluded()                        -> List[dict]   (Excluded='Yes' rows)
+    count_all()                            -> dict         ({active, excluded, total, per-status})
+    mark_in_processing(ids)                -> dict         (rows updated)
+    mark_excluded(ids)                     -> dict         (rows FLAGGED Excluded='Yes')
+    restore_excluded(ids)                  -> dict         (rows FLAGGED Excluded='No')
 
-Exclusion is a **recoverable soft-delete**: the row is MOVED (INSERT + DELETE
-inside a single transaction) into `ContractInventory_Excluded`.  Restore is
-the reverse.  Original FileID is preserved end-to-end.  No SharePoint file
-is ever touched.
+Exclusion model (post 2026-09-22 refactor)
+──────────────────────────────────────────
+Excluded documents live in the SAME master inventory as everything else.
+There is no separate "excluded" table on the read path — Excluded is just
+a status flag (`Excluded='Yes'`, plus `ExcludedDate` / `ExcludedBy`
+metadata columns).  Views:
+
+    ContractInventory
+        ├── Excluded = 'No'  → active inventory (review UI)
+        │       ├── MigrationStatus = 'Pending'
+        │       ├── MigrationStatus = 'In Processing'
+        │       ├── MigrationStatus = 'Migrated'
+        │       └── MigrationStatus = 'Failed'
+        └── Excluded = 'Yes' → excluded view (recoverable soft-delete)
+
+The legacy ContractInventory_Excluded table is preserved for AUDIT ONLY:
+_ensure_schema_once() runs a one-time back-migration that copies any rows
+still in that table back into the master with Excluded='Yes' (dedup on
+FileID + preserves ExcludedDate/ExcludedBy).  After that first pass the
+legacy table is never written to and no read path touches it.
 
 The JSON keys returned by these functions are the **same camelCase names**
 the existing Manual Review UI already reads.
@@ -26,10 +42,13 @@ from core.config import settings
 from core.database import (
     FOLDER_LEVEL_MAX,
     ensure_excluded_column,
+    ensure_excluded_metadata_columns,
     ensure_excluded_table,
     ensure_exclusion_audit_table,
     ensure_folder_columns,
+    ensure_migration_integration_columns,
     ensure_migration_status_column,
+    ensure_submitted_by_column,
     exclusion_audit_table_name,
     excluded_table_name,
     get_connection,
@@ -42,6 +61,35 @@ STATUS_IN_PROCESSING = "In Processing"
 STATUS_MIGRATED      = "Migrated"
 STATUS_FAILED        = "Failed"
 
+# Statuses that count as "actively occupying" the platform queue for the
+# per-user workload lock.  Rows in any of these statuses block their
+# SubmittedBy owner from starting another migration batch.  Terminal
+# statuses (Migrated / Failed / Skipped / Excluded) do NOT block.
+#
+# Includes 'In Processing' (our canonical MigrationStatus value) plus the
+# raw backend enum values that transient sync races might leave in
+# MigrationBackendStatus but the sync poller then rolls up into
+# MigrationStatus.  Filtering on MigrationStatus alone is sufficient because
+# apply_backend_file_status() always maps queued/retrying/pending-with-a-
+# request-id back to STATUS_IN_PROCESSING on our side.
+ACTIVE_MIGRATION_STATUSES = (STATUS_IN_PROCESSING,)
+
+
+class ActiveMigrationExistsError(RuntimeError):
+    """Raised by mark_in_processing() when the caller (identified by email)
+    already has one or more rows in an active migration status.
+
+    Carries the current count so /api/migrate can echo it in the 409
+    response body without re-querying.
+    """
+    def __init__(self, email: str, active_count: int):
+        self.email = email
+        self.active_count = int(active_count)
+        super().__init__(
+            f"User {email!r} already has {active_count} active migration row(s)."
+        )
+
+
 logger = logging.getLogger(__name__)
 
 # Lazily bring the schema up to date on the first DB access this process makes.
@@ -50,79 +98,130 @@ _schema_ready = False
 
 
 def _ensure_schema_once() -> None:
-    """Idempotent, cached: add Excluded column + create excluded table +
-    move any legacy Excluded='Yes' rows into the excluded table so state is
-    normalised (excluded rows live ONLY in the excluded table).
+    """Idempotent, cached: bring the schema up to date for the current
+    process on the first DB access.
 
-    Also (folder-hierarchy feature) adds Folder1..Folder20 to both tables,
-    creates the exclusion_audit sidecar, and backfills folder columns from
-    SharePointPath the first time it runs.
+    Steps (in order — each is idempotent on its own):
+      1. Add [Excluded] column to master inventory (legacy schemas).
+      2. Add [ExcludedDate] + [ExcludedBy] to master inventory (unified
+         inventory model — replaces the metadata that used to live on
+         ContractInventory_Excluded).
+      3. Create the legacy excluded table if missing — needed only so the
+         back-migration in step 8 has something to read from.  After the
+         back-migration runs successfully, this table is no longer written
+         to (kept for historical audit only).
+      4. Add [MigrationStatus] to both tables.
+      5. Add Folder01..Folder20 to both tables.
+      6. Add migration-platform integration columns to both tables.
+      7. Create the exclusion_audit sidecar.
+      8. Back-migrate any rows still in ContractInventory_Excluded into
+         the master inventory with Excluded='Yes' (one-shot; dedup on
+         FileID; preserves ExcludedDate/ExcludedBy).
+      9. Backfill Folder01..Folder20 from SharePointPath.
+
+    Never let a schema-check failure crash reads — log and retry next call.
     """
     global _schema_ready
     if _schema_ready:
         return
     try:
         ensure_excluded_column()
-        ensure_excluded_table()
+        ensure_excluded_metadata_columns()
+        ensure_excluded_table()                    # legacy — retained for step 8
         ensure_migration_status_column()
-        # Folder-hierarchy additions.  DDL must run BEFORE the legacy
-        # excluded-row migration because that migration copies the full
-        # _COLUMNS list (which now includes Folder1..Folder20) between
-        # tables — both sides need the columns to exist.
         ensure_folder_columns()
+        ensure_migration_integration_columns()
+        ensure_submitted_by_column()               # per-user workload lock
         ensure_exclusion_audit_table()
-        _migrate_legacy_excluded_rows()
+        _migrate_legacy_excluded_table_back()      # one-shot back-migration
         backfill_folder_columns()
         _schema_ready = True
     except Exception as exc:
-        # Never let a schema-check failure crash reads — log and retry next call.
         logger.warning("_ensure_schema_once() failed: %s", exc)
 
 
-def _migrate_legacy_excluded_rows() -> None:
-    """One-time cleanup: any rows in ContractInventory that were flagged
-    Excluded='Yes' by the earlier in-place implementation are MOVED into
-    the excluded table (transactional) so the new architecture has a single
-    source of truth per row.
+def _migrate_legacy_excluded_table_back() -> None:
+    """One-shot back-migration for the unified-inventory refactor.
 
-    Safe to run repeatedly — no-op after the first successful migration."""
+    Prior to the refactor, excluded documents were physically moved into
+    a separate ContractInventory_Excluded table.  The new model keeps them
+    on the master ContractInventory row with `Excluded='Yes'` and inline
+    exclusion metadata (`ExcludedDate`, `ExcludedBy`).  This function
+    reconciles those two models the first time it runs on a database that
+    still has rows in the legacy excluded table.
+
+    Behaviour (all inside one transaction per call — idempotent):
+      1. Any excluded-table row whose FileID does NOT exist in the master
+         → INSERT into master with the row's business + folder + migration
+         columns, `Excluded='Yes'`, and its original ExcludedDate/ExcludedBy.
+      2. Any excluded-table row whose FileID DOES exist in the master →
+         UPDATE the master row to `Excluded='Yes'` (+ ExcludedDate/ExcludedBy
+         from the legacy row) so state is unified.  No column values from
+         the master are lost — we only flip the Excluded flag and stamp
+         the two metadata columns.
+      3. Legacy rows are NEVER deleted here.  The legacy table is kept as
+         a historical audit artefact.  After this back-migration runs, the
+         two exclusion write paths (mark_excluded, restore_excluded) only
+         touch the master table.
+
+    Safe to run repeatedly: step 1 uses `NOT IN` so no duplicates are
+    created; step 2 is an idempotent UPDATE.  Fails-soft: any exception
+    rolls back and leaves state untouched — the caller (which is the
+    schema-check pass) logs a warning and the app continues.
+    """
     active = settings.CONTRACT_TABLE
-    ex = excluded_table_name()
+    ex     = excluded_table_name()
     with get_connection() as cn:
         cn.autocommit = False
         cur = cn.cursor()
         try:
-            # Count how many are eligible
-            cur.execute(
-                f"SELECT COUNT(*) FROM dbo.[{active}] WHERE ISNULL([Excluded], 'No') = 'Yes'"
-            )
-            n = cur.fetchone()[0] or 0
-            if n == 0:
+            # How many legacy rows exist?  Cheap gate — most calls will
+            # short-circuit here after the first successful migration
+            # (once the legacy table has been fully back-migrated, ops
+            # will typically leave the empty table alone or drop it).
+            cur.execute(f"SELECT COUNT(*) FROM dbo.[{ex}]")
+            legacy_n = cur.fetchone()[0] or 0
+            if legacy_n == 0:
                 cn.rollback()
                 return
 
-            # INSERT ... SELECT copies the row shape (all columns except the
-            # active-only Excluded flag).  ExcludedDate defaults to SYSUTCDATETIME().
-            copy_cols = ", ".join(f"[{c}]" for c in _COLUMNS)  # same order both sides
+            # Step 1 — INSERT rows that are ONLY in the legacy table into
+            # the master with Excluded='Yes' and the preserved metadata.
+            # We build the column list explicitly (same order both sides).
+            copy_cols_sql = ", ".join(f"[{c}]" for c in _COLUMNS)
             cur.execute(
-                f"INSERT INTO dbo.[{ex}] ({copy_cols}) "
-                f"SELECT {copy_cols} FROM dbo.[{active}] "
-                f"WHERE ISNULL([Excluded], 'No') = 'Yes' "
-                f"  AND [FileID] NOT IN (SELECT [FileID] FROM dbo.[{ex}])"
+                f"INSERT INTO dbo.[{active}] "
+                f"    ({copy_cols_sql}, [Excluded], [ExcludedDate], [ExcludedBy]) "
+                f"SELECT {copy_cols_sql}, 'Yes', [ExcludedDate], [ExcludedBy] "
+                f"FROM   dbo.[{ex}] AS L "
+                f"WHERE  L.[FileID] NOT IN (SELECT [FileID] FROM dbo.[{active}])"
             )
-            copied = cur.rowcount
+            inserted = cur.rowcount
 
-            # Delete originals (including any that were already in the excluded
-            # table — dedup to that table's copy).
+            # Step 2 — for FileIDs that ALREADY exist in master, just flag
+            # them Excluded and pull across the exclusion metadata (leave
+            # every other column value in the master untouched).  We only
+            # touch rows currently Excluded='No' so a repeat run is a
+            # true no-op.
             cur.execute(
-                f"DELETE FROM dbo.[{active}] WHERE ISNULL([Excluded], 'No') = 'Yes'"
+                f"UPDATE M "
+                f"SET    M.[Excluded]     = 'Yes', "
+                f"       M.[ExcludedDate] = COALESCE(M.[ExcludedDate], L.[ExcludedDate]), "
+                f"       M.[ExcludedBy]   = COALESCE(M.[ExcludedBy],   L.[ExcludedBy]) "
+                f"FROM   dbo.[{active}] AS M "
+                f"JOIN   dbo.[{ex}]     AS L ON L.[FileID] = M.[FileID] "
+                f"WHERE  ISNULL(M.[Excluded], 'No') <> 'Yes'"
             )
-            deleted = cur.rowcount
+            updated = cur.rowcount
+
             cn.commit()
-            logger.info(
-                "_migrate_legacy_excluded_rows: copied=%d deleted=%d",
-                copied, deleted,
-            )
+            if inserted or updated:
+                logger.info(
+                    "_migrate_legacy_excluded_table_back: legacy_rows=%d "
+                    "inserted_into_master=%d flagged_in_master=%d "
+                    "(legacy table retained for audit)",
+                    legacy_n, inserted, updated,
+                )
         except Exception:
             cn.rollback()
             raise
@@ -148,7 +247,17 @@ _BASE_COLUMNS = [
 # continue to tack ExcludedDate/ExcludedBy on the very end.
 FOLDER_COLUMNS = [f"Folder{i:02d}" for i in range(1, FOLDER_LEVEL_MAX + 1)]
 
-_COLUMNS = _BASE_COLUMNS + FOLDER_COLUMNS
+# Migration-platform integration columns — MUST match the order added by
+# core.database.ensure_migration_integration_columns() and appear LAST in
+# _COLUMNS so restoring an excluded row still picks up ExcludedDate /
+# ExcludedBy at fixed tail offsets in load_excluded().
+MIGRATION_INTEGRATION_COLUMNS = [
+    "MigrationRequestId", "MigrationFileItemId", "MigrationSubmittedAt",
+    "MigrationBackendStatus", "MigrationRetryCount", "MigrationErrorCode",
+    "DestinationUrl", "MigrationLastSyncedAt",
+]
+
+_COLUMNS = _BASE_COLUMNS + FOLDER_COLUMNS + MIGRATION_INTEGRATION_COLUMNS
 
 
 def _s(v) -> str | None:
@@ -366,97 +475,264 @@ def _row_to_dict(row) -> dict:
     # without a placeholder and folder-search checks can skip them.
     for i in range(1, FOLDER_LEVEL_MAX + 1):
         out[f"folder{i}"] = _s(r.get(f"Folder{i:02d}"))
+    # Migration-platform integration fields.  These are the mapping/observation
+    # values populated by the /api/migrate submit + /api/migrations/sync
+    # poll paths.  All optional — a Pending row will have every field null.
+    out["migrationRequestId"]     = _s(r.get("MigrationRequestId"))
+    out["migrationFileItemId"]    = _s(r.get("MigrationFileItemId"))
+    out["migrationSubmittedAt"]   = _fmt_dt(r.get("MigrationSubmittedAt"))
+    out["migrationBackendStatus"] = _s(r.get("MigrationBackendStatus"))
+    # retry_count is a plain int on the backend; return as int|null (not str)
+    # so the frontend can format "Retry N of M" without re-parsing.
+    _rc = r.get("MigrationRetryCount")
+    out["migrationRetryCount"]    = int(_rc) if isinstance(_rc, (int,)) or (isinstance(_rc, str) and _rc.isdigit()) else None
+    out["migrationErrorCode"]     = _s(r.get("MigrationErrorCode"))
+    out["destinationUrl"]         = _s(r.get("DestinationUrl"))
+    out["migrationLastSyncedAt"]  = _fmt_dt(r.get("MigrationLastSyncedAt"))
     return out
 
 
 # ── Reads ──────────────────────────────────────────────────────────────────
-def load_contracts() -> List[dict]:
-    """Return every ACTIVE row from ContractInventory.
+def load_contracts(include_excluded: bool = False) -> List[dict]:
+    """Return inventory rows from ContractInventory.
 
-    Excluded rows live in a separate table (ContractInventory_Excluded) and
-    are never returned here.  Persistent — survives reload/restart.
+    Parameters
+    ----------
+    include_excluded : bool, default False
+        False (default, used by the Manual Review UI):
+            Return only rows currently NOT excluded (`Excluded='No'`).
+            This is the review-view working set — Yet-to-be-Migrated +
+            In Processing + Migrated + Failed all live here.
+        True (used by the "Total Documents" CSV export):
+            Return the ENTIRE master inventory, including excluded rows,
+            so the export CSV can honour the manager's requirement that
+            Total Documents represents the complete inventory.
+
+    The `Excluded`, `ExcludedDate`, `ExcludedBy` fields are ALWAYS returned
+    on every row (see `_row_to_dict`) so a caller receiving mixed rows can
+    tell them apart without a second lookup.
     """
     _ensure_schema_once()
     cols = ", ".join(f"[{c}]" for c in _COLUMNS)
-    sql = f"SELECT {cols} FROM dbo.[{settings.CONTRACT_TABLE}] ORDER BY [FileName]"
-    with get_connection() as cn:
-        cur = cn.cursor()
-        cur.execute(sql)
-        rows = cur.fetchall()
-    logger.info("load_contracts: %d active rows from dbo.%s", len(rows), settings.CONTRACT_TABLE)
-    return [_row_to_dict(r) for r in rows]
-
-
-def load_excluded() -> List[dict]:
-    """Return every row in the excluded table, newest exclusion first.
-
-    Includes `excludedDate` (ISO-ish string via _fmt_dt) so the UI can show
-    when each document was excluded.
-    """
-    _ensure_schema_once()
-    ex = excluded_table_name()
-    cols = ", ".join(f"[{c}]" for c in _COLUMNS) + ", [ExcludedDate], [ExcludedBy]"
-    sql = f"SELECT {cols} FROM dbo.[{ex}] ORDER BY [ExcludedDate] DESC, [FileName]"
+    # ExcludedDate/ExcludedBy are appended AFTER the fixed _COLUMNS list so
+    # _row_to_dict receives its expected column count and the tail-offset
+    # slicing below stays deterministic.
+    tail = ", [Excluded], [ExcludedDate], [ExcludedBy]"
+    where = "" if include_excluded else "WHERE ISNULL([Excluded], 'No') <> 'Yes' "
+    sql = (f"SELECT {cols}{tail} "
+           f"FROM dbo.[{settings.CONTRACT_TABLE}] "
+           f"{where}"
+           f"ORDER BY [FileName]")
     with get_connection() as cn:
         cur = cn.cursor()
         cur.execute(sql)
         rows = cur.fetchall()
     out = []
+    n = len(_COLUMNS)
     for row in rows:
-        d = _row_to_dict(row[: len(_COLUMNS)])
-        d["excludedDate"] = _fmt_dt(row[len(_COLUMNS)])
-        d["excludedBy"]   = _s(row[len(_COLUMNS) + 1])
+        d = _row_to_dict(row[:n])
+        # Same keys the pre-refactor `load_excluded` used, so the client's
+        # excluded-view rendering (which reads d.excludedDate / d.excludedBy)
+        # keeps working unchanged.
+        d["excluded"]     = "Yes" if (_s(row[n]) or "").lower() == "yes" else "No"
+        d["excludedDate"] = _fmt_dt(row[n + 1])
+        d["excludedBy"]   = _s(row[n + 2])
         out.append(d)
-    logger.info("load_excluded: %d rows from dbo.%s", len(out), ex)
+    logger.info(
+        "load_contracts: %d rows from dbo.%s (include_excluded=%s)",
+        len(out), settings.CONTRACT_TABLE, include_excluded,
+    )
     return out
 
 
-def count_all() -> dict:
-    """Return per-bucket population counts.
+def load_excluded() -> List[dict]:
+    """Return every currently-excluded row from ContractInventory,
+    newest exclusion first.
 
-    Response keys:
-        active         — rows in the active table (Pending + In Processing + Migrated + Failed)
-        excluded       — rows in the excluded table
-        total          — same as active (Total Documents bucket)
-        pending        — rows with MigrationStatus = 'Pending'
-        in_processing  — rows with MigrationStatus = 'In Processing'
-        migrated       — rows with MigrationStatus = 'Migrated'
-        failed         — rows with MigrationStatus = 'Failed'
-
-    NOTE — "total" continues to be the ACTIVE count only (not active + excluded)
-    so the existing UI identity Pending + In Processing + Migrated == Total
-    still holds within the active table.
+    Post-refactor these rows live on the SAME master table as everything
+    else — the difference is just `Excluded='Yes'`.  Kept as a separate
+    function so the /api/excluded endpoint and its callers don't have to
+    change; internally it's a simple filtered SELECT on the master.
     """
     _ensure_schema_once()
     active = settings.CONTRACT_TABLE
-    ex = excluded_table_name()
+    cols = ", ".join(f"[{c}]" for c in _COLUMNS) + ", [ExcludedDate], [ExcludedBy]"
+    sql = (f"SELECT {cols} "
+           f"FROM dbo.[{active}] "
+           f"WHERE ISNULL([Excluded], 'No') = 'Yes' "
+           f"ORDER BY [ExcludedDate] DESC, [FileName]")
     with get_connection() as cn:
         cur = cn.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM dbo.[{active}]")
+        cur.execute(sql)
+        rows = cur.fetchall()
+    out = []
+    n = len(_COLUMNS)
+    for row in rows:
+        d = _row_to_dict(row[:n])
+        d["excludedDate"] = _fmt_dt(row[n])
+        d["excludedBy"]   = _s(row[n + 1])
+        out.append(d)
+    logger.info("load_excluded: %d rows (Excluded='Yes') from dbo.%s", len(out), active)
+    return out
+
+
+def count_all(user_email: str | None = None) -> dict:
+    """Return per-bucket population counts from the unified master inventory.
+
+    Response keys (always present):
+        active         — rows with `Excluded='No'` (Manual Review working set)
+        excluded       — rows with `Excluded='Yes'`
+        total          — active + excluded (COMPLETE inventory)
+        pending        — active rows with MigrationStatus = 'Pending'
+        in_processing  — active rows with MigrationStatus = 'In Processing'
+        migrated       — active rows with MigrationStatus = 'Migrated'
+        failed         — active rows with MigrationStatus = 'Failed'
+
+    When `user_email` is provided (non-empty), THREE additional keys are
+    returned for the per-user workload-lock feature:
+        my_in_processing   — how many of the OVERALL in_processing rows
+                             belong to this user (SubmittedBy match,
+                             case-insensitive)
+        my_active_total    — same, across every ACTIVE_MIGRATION_STATUSES
+                             value (currently the same as
+                             my_in_processing but future-proofed for
+                             adding Queued/Retrying)
+        can_migrate        — bool; True iff my_active_total == 0.  UI
+                             uses this to gate the Migrate button.
+
+    IMPORTANT (unified-inventory refactor): `total` = active + excluded so
+    the UI identity `Total = Yet-to-be-Migrated + In Processing + Migrated
+    + Excluded` holds on the server as well as the client.  Per-status
+    counts are computed over ACTIVE rows only so an excluded-but-Migrated
+    row is counted once (in `excluded`) rather than double-counted.
+
+    Per-user counts intentionally IGNORE the Excluded flag: if a row is
+    still in an active migration status it counts against its submitter
+    regardless of whether some concurrent action flagged it excluded
+    (that shouldn't happen — mark_excluded refuses In Processing rows —
+    but the count is a safety net not a correctness contract).
+    """
+    _ensure_schema_once()
+    active = settings.CONTRACT_TABLE
+    submitter = _normalise_email(user_email)
+    status_list = ", ".join(f"'{s}'" for s in ACTIVE_MIGRATION_STATUSES)
+    with get_connection() as cn:
+        cur = cn.cursor()
+        # Two COUNT(*) with a WHERE — cheap, one table scan each on
+        # ContractInventory (~641 rows in current inventory).
+        cur.execute(
+            f"SELECT COUNT(*) FROM dbo.[{active}] "
+            f"WHERE ISNULL([Excluded], 'No') <> 'Yes'"
+        )
         a = cur.fetchone()[0] or 0
-        cur.execute(f"SELECT COUNT(*) FROM dbo.[{ex}]")
+        cur.execute(
+            f"SELECT COUNT(*) FROM dbo.[{active}] "
+            f"WHERE ISNULL([Excluded], 'No') = 'Yes'"
+        )
         e = cur.fetchone()[0] or 0
-        # Per-status counts on the active table.  Uses ISNULL so any
-        # pre-existing NULL rows land in Pending (matches column default).
+        # Per-status counts over ACTIVE rows only.  The `AND Excluded<>'Yes'`
+        # guard is critical — without it, an excluded-but-Migrated row would
+        # get counted in both `migrated` and `excluded`, breaking the
+        # identity Total = Yet + In Processing + Migrated + Excluded.
         cur.execute(
             f"SELECT ISNULL([MigrationStatus], '{STATUS_PENDING}') AS s, COUNT(*) "
-            f"FROM dbo.[{active}] GROUP BY ISNULL([MigrationStatus], '{STATUS_PENDING}')"
+            f"FROM dbo.[{active}] "
+            f"WHERE ISNULL([Excluded], 'No') <> 'Yes' "
+            f"GROUP BY ISNULL([MigrationStatus], '{STATUS_PENDING}')"
         )
         by_status = {str(row[0] or STATUS_PENDING): int(row[1] or 0) for row in cur.fetchall()}
-    return {
+
+        # Optional per-user slice — one extra seek on the filtered index
+        # IX_{table}_SubmittedBy_Active, no impact on the anonymous path.
+        my_in_processing = 0
+        my_active_total  = 0
+        if submitter:
+            cur.execute(
+                f"SELECT "
+                f"  SUM(CASE WHEN [MigrationStatus] = ? THEN 1 ELSE 0 END), "
+                f"  SUM(CASE WHEN [MigrationStatus] IN ({status_list}) THEN 1 ELSE 0 END) "
+                f"FROM dbo.[{active}] "
+                f"WHERE LOWER(ISNULL([SubmittedBy], '')) = ?",
+                [STATUS_IN_PROCESSING, submitter],
+            )
+            r = cur.fetchone()
+            my_in_processing = int((r[0] if r else 0) or 0)
+            my_active_total  = int((r[1] if r else 0) or 0)
+
+    out = {
         "active":        int(a),
         "excluded":      int(e),
-        "total":         int(a),
+        # Total = complete inventory (active + excluded).  Manager spec:
+        # "Total Documents must include Excluded".
+        "total":         int(a) + int(e),
         "pending":       by_status.get(STATUS_PENDING, 0),
         "in_processing": by_status.get(STATUS_IN_PROCESSING, 0),
         "migrated":      by_status.get(STATUS_MIGRATED, 0),
         "failed":        by_status.get(STATUS_FAILED, 0),
     }
+    if submitter:
+        out["my_in_processing"] = my_in_processing
+        out["my_active_total"]  = my_active_total
+        out["can_migrate"]      = (my_active_total == 0)
+    return out
+
+
+# ── Per-user workload-lock helpers ────────────────────────────────────────
+def _normalise_email(email: str | None) -> str:
+    """Canonicalise an email for storage/comparison.
+
+    Session cookies always carry the exact-cased login email, but users
+    can log in with either case ("USERA@x.com" vs "usera@x.com").  We
+    store and compare in lower-case so a same-user race across two tabs
+    that happen to have different casing still resolves to one owner.
+    Empty / None → empty string (callers treat as "no user identity").
+    """
+    return (email or "").strip().lower()
+
+
+def get_user_active_migration_count(email: str) -> int:
+    """Return how many inventory rows this email currently owns in an
+    ACTIVE migration status (Pending-with-request-id / In Processing /
+    Retrying).  Zero for unknown users or rows never submitted by this
+    user.  Case-insensitive on the stored SubmittedBy column.
+
+    Cheap point-lookup: hits IX_{table}_SubmittedBy_Active (filtered
+    index on the same status set) — a seek regardless of table size.
+    """
+    _ensure_schema_once()
+    e = _normalise_email(email)
+    if not e:
+        return 0
+    table = settings.CONTRACT_TABLE
+    status_list = ", ".join(f"'{s}'" for s in ACTIVE_MIGRATION_STATUSES)
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM dbo.[{table}] "
+            f"WHERE LOWER(ISNULL([SubmittedBy], '')) = ? "
+            f"  AND [MigrationStatus] IN ({status_list})",
+            [e],
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def can_user_start_migration(email: str) -> tuple[bool, int]:
+    """Convenience wrapper around get_user_active_migration_count().
+
+    Returns (allowed, active_count).  `allowed` is True iff the caller
+    currently has zero active rows.  The tuple form lets callers avoid
+    a second query when they need the count for the response body.
+    """
+    n = get_user_active_migration_count(email)
+    return (n == 0, n)
 
 
 # ── Writes ─────────────────────────────────────────────────────────────────
-def mark_in_processing(file_ids: Iterable[str]) -> dict:
-    """Transition eligible rows from 'Pending' → 'In Processing'.
+def mark_in_processing(file_ids: Iterable[str],
+                       submitted_by: str | None = None) -> dict:
+    """Transition eligible rows from 'Pending' → 'In Processing' AND stamp
+    the submitting user on each row (SubmittedBy).
 
     Called immediately after the user confirms the Migrate modal, BEFORE
     the Power Automate call.  Persisting this state first ensures:
@@ -465,40 +741,92 @@ def mark_in_processing(file_ids: Iterable[str]) -> dict:
         which files were in flight,
       - Migrate=Yes and MigratedDate are NOT touched (business rule 4).
 
-    Only rows currently in 'Pending' are transitioned — already-processing
-    or already-migrated rows are silently skipped (business rule 15).
-    Returns which FileIDs actually flipped so the caller can send exactly
-    those to Power Automate.
+    Per-user workload lock (task 2026-09-24)
+    ────────────────────────────────────────
+    When `submitted_by` is provided (any non-empty email), a single
+    SQL transaction performs, in order:
+
+        1. SELECT the caller's current active-status row count with a
+           HOLDLOCK / UPDLOCK hint so a concurrent second submission for
+           the SAME email is serialised behind us (Azure SQL locks the
+           key range under snapshot-isolation-default databases too).
+        2. If the count is > 0 → raise ActiveMigrationExistsError and
+           roll back.  Nothing on the row set changes.
+        3. Otherwise UPDATE the eligible rows to In Processing + stamp
+           SubmittedBy in ONE statement (same transaction) so no
+           interleaved reader can see rows flipped to In Processing
+           without their owner set.
+
+    When `submitted_by` is None / empty (legacy callers), steps 1-2 are
+    skipped and step 3 still runs but SubmittedBy is left NULL.  This
+    keeps existing tests / call sites that don't care about ownership
+    working.
+
+    Only rows currently in 'Pending' or 'Failed' are transitioned —
+    already-processing or already-migrated rows are silently skipped
+    (business rule 15).  Excluded='Yes' rows are also skipped
+    (unified-inventory refactor guard).  Returns which FileIDs actually
+    flipped so the caller can send exactly those to the platform.
     """
     _ensure_schema_once()
     ids = [str(i).strip() for i in file_ids if str(i).strip()]
     if not ids:
         return {"succeeded": [], "skipped": [], "rowsAffected": 0}
 
+    submitter = _normalise_email(submitted_by)
     table = settings.CONTRACT_TABLE
     placeholders = ", ".join("?" for _ in ids)
+    status_list = ", ".join(f"'{s}'" for s in ACTIVE_MIGRATION_STATUSES)
 
     with get_connection() as cn:
         cn.autocommit = False
         cur = cn.cursor()
         try:
-            # Eligible transitions to In Processing:
-            #   Pending → In Processing   (first-time migration)
-            #   Failed  → In Processing   (user retry after a prior failure)
-            # Never touch rows that are already 'In Processing' (duplicate
-            # submit) or 'Migrated' (§15 — cannot re-migrate).
+            # Step 1 — atomic per-user lock check.  Skipped when caller
+            # didn't identify itself (back-compat with tests / scripts).
+            #
+            # UPDLOCK + HOLDLOCK together take a U-lock on any matching
+            # rows and hold it to the end of the transaction, which under
+            # both READ COMMITTED and SNAPSHOT isolation blocks another
+            # concurrent transaction that tries to take the same U-lock
+            # for the same email.  Two /api/migrate calls from the same
+            # user racing across two tabs therefore serialise: the second
+            # one sees the first one's rows already flipped and raises.
+            if submitter:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM dbo.[{table}] "
+                    f"WITH (UPDLOCK, HOLDLOCK) "
+                    f"WHERE LOWER(ISNULL([SubmittedBy], '')) = ? "
+                    f"  AND [MigrationStatus] IN ({status_list})",
+                    [submitter],
+                )
+                active_count = int(cur.fetchone()[0] or 0)
+                if active_count > 0:
+                    cn.rollback()
+                    raise ActiveMigrationExistsError(submitter, active_count)
+
+            # Step 2 — flip eligible rows AND stamp SubmittedBy in the
+            # same UPDATE so ownership is atomic with the status change.
+            # A NULL submitter parameter leaves the existing SubmittedBy
+            # value in place via COALESCE (relevant when a legacy call
+            # site retries a Failed row that was previously stamped by
+            # its original submitter — we keep the original owner).
             cur.execute(
                 f"UPDATE dbo.[{table}] "
-                f"SET [MigrationStatus] = ? "
+                f"SET   [MigrationStatus] = ?, "
+                f"      [SubmittedBy]     = COALESCE(?, [SubmittedBy]) "
                 f"WHERE [FileID] IN ({placeholders}) "
                 f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') IN "
                 f"       ('{STATUS_PENDING}', '{STATUS_FAILED}') "
-                f"  AND ISNULL([Migrate], 'No') <> 'Yes'",
-                [STATUS_IN_PROCESSING, *ids],
+                f"  AND ISNULL([Migrate], 'No') <> 'Yes' "
+                f"  AND ISNULL([Excluded], 'No') <> 'Yes'",
+                [STATUS_IN_PROCESSING,
+                 (submitter or None),
+                 *ids],
             )
             affected = cur.rowcount
 
-            # Capture which IDs actually made it into In Processing.
+            # Step 3 — capture which IDs actually made it into In Processing.
             cur.execute(
                 f"SELECT [FileID] FROM dbo.[{table}] "
                 f"WHERE [FileID] IN ({placeholders}) "
@@ -507,6 +835,10 @@ def mark_in_processing(file_ids: Iterable[str]) -> dict:
             )
             succeeded = [str(r[0]) for r in cur.fetchall()]
             cn.commit()
+        except ActiveMigrationExistsError:
+            # Roll back already performed above; re-raise unchanged so
+            # /api/migrate can translate to a 409.
+            raise
         except Exception:
             cn.rollback()
             raise
@@ -515,8 +847,9 @@ def mark_in_processing(file_ids: Iterable[str]) -> dict:
 
     skipped = [i for i in ids if i not in set(succeeded)]
     logger.info(
-        "mark_in_processing: requested=%d affected=%d skipped=%d table=dbo.%s",
-        len(ids), affected, len(skipped), table,
+        "mark_in_processing: requested=%d affected=%d skipped=%d "
+        "submitted_by=%s table=dbo.%s",
+        len(ids), affected, len(skipped), submitter or "-", table,
     )
     return {"succeeded": succeeded, "skipped": skipped, "rowsAffected": affected}
 
@@ -612,6 +945,351 @@ def apply_migration_result(
     }
 
 
+def get_rows_for_submission(file_ids: Iterable[str]) -> List[dict]:
+    """Return full inventory rows for the given FileIDs — but ONLY those
+    currently 'In Processing' after mark_in_processing() has flipped them.
+
+    Includes the persisted folder columns and (importantly for the
+    migration platform integration) the raw SharePointPath so the caller
+    can derive site_url / library / source_path via
+    services.migration_paths.parse_sharepoint_url.
+
+    This is the input to MigrationPlatformService.group_files_for_submission.
+    """
+    _ensure_schema_once()
+    ids = [str(i).strip() for i in file_ids if str(i).strip()]
+    if not ids:
+        return []
+    table = settings.CONTRACT_TABLE
+    ph = ", ".join("?" for _ in ids)
+    cols = ", ".join(f"[{c}]" for c in _COLUMNS)
+    sql = (
+        f"SELECT {cols} FROM dbo.[{table}] "
+        f"WHERE [FileID] IN ({ph}) "
+        f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'"
+    )
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(sql, ids)
+        rows = cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def record_submission(
+    file_ids: Iterable[str],
+    *,
+    migration_request_id: str,
+    file_item_id_by_local_id: dict[str, str] | None = None,
+) -> dict:
+    """Persist the migration-platform reference IDs on each submitted row.
+
+    Called AFTER MigrationPlatformService.create_migration + add_files_batch
+    succeeds.  Rows keep their MigrationStatus='In Processing' — the
+    backend has now accepted them and the poller will observe transitions.
+
+    Parameters
+    ----------
+    file_ids
+        Local inventory FileIDs that were successfully submitted.
+    migration_request_id
+        The UUID returned by POST /api/v1/migrations.
+    file_item_id_by_local_id
+        Optional mapping local FileID → platform file_item UUID as
+        returned by the batch-add response.  Rows not present are still
+        marked with the migration_request_id so a later /sync can look
+        them up by request+file_name.
+
+    Returns { rowsAffected, submittedAt }.
+    """
+    _ensure_schema_once()
+    ids = [str(i).strip() for i in file_ids if str(i).strip()]
+    if not ids:
+        return {"rowsAffected": 0, "submittedAt": None}
+
+    now = datetime.utcnow()
+    table = settings.CONTRACT_TABLE
+    mapping = file_item_id_by_local_id or {}
+
+    with get_connection() as cn:
+        cn.autocommit = False
+        cur = cn.cursor()
+        try:
+            # Two UPDATEs: one path when we know the file_item_id, one path
+            # when we don't (fallback — the sync poll will fill it in).
+            with_ids    = [fid for fid in ids if mapping.get(fid)]
+            without_ids = [fid for fid in ids if not mapping.get(fid)]
+
+            if with_ids:
+                # executemany — one round-trip per row, but the batch is
+                # small (<= user's page selection).
+                cur.fast_executemany = True
+                cur.executemany(
+                    f"UPDATE dbo.[{table}] "
+                    f"SET [MigrationRequestId]    = ?, "
+                    f"    [MigrationFileItemId]   = ?, "
+                    f"    [MigrationSubmittedAt]  = ?, "
+                    f"    [MigrationBackendStatus]= ?, "
+                    f"    [MigrationLastSyncedAt] = ?, "
+                    f"    [RunId]                 = ? "
+                    f"WHERE [FileID] = ? "
+                    f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'",
+                    [
+                        (migration_request_id, mapping[fid], now, "pending",
+                         now, migration_request_id, fid)
+                        for fid in with_ids
+                    ],
+                )
+
+            if without_ids:
+                ph = ", ".join("?" for _ in without_ids)
+                cur.execute(
+                    f"UPDATE dbo.[{table}] "
+                    f"SET [MigrationRequestId]    = ?, "
+                    f"    [MigrationSubmittedAt]  = ?, "
+                    f"    [MigrationBackendStatus]= ?, "
+                    f"    [MigrationLastSyncedAt] = ?, "
+                    f"    [RunId]                 = ? "
+                    f"WHERE [FileID] IN ({ph}) "
+                    f"  AND [MigrationStatus] = '{STATUS_IN_PROCESSING}'",
+                    [migration_request_id, now, "pending", now,
+                     migration_request_id, *without_ids],
+                )
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
+
+    logger.info(
+        "record_submission: migration_id=%s rows=%d mapped=%d",
+        migration_request_id, len(ids), len(mapping),
+    )
+    return {"rowsAffected": len(ids), "submittedAt": _fmt_dt(now)}
+
+
+def apply_backend_file_status(
+    updates: list[dict],
+) -> dict:
+    """Persist the outcome of a single /api/migrations/sync poll cycle.
+
+    Each ``update`` is a plain dict:
+        {
+          "fileID":           "337,514",                 required
+          "backendStatus":    "completed" | "failed" | ...,   required
+          "uiStatus":         "Migrated" | "In Processing" | "Failed" | "Skipped",
+          "migrationFileItemId": "<uuid>" | None,
+          "retryCount":       int | None,
+          "errorMessage":     str  | None,
+          "errorCode":        str  | None,
+          "destinationUrl":   str  | None,
+        }
+
+    Only rows CURRENTLY in an active state (In Processing or Failed) are
+    touched — this protects against late/out-of-order polls trying to
+    downgrade a Migrated row.  ``Migrated → Migrated`` and repeated
+    ``Failed → Failed`` writes are idempotent.
+
+    Returns per-bucket counts of rows actually updated.
+    """
+    _ensure_schema_once()
+    if not updates:
+        return {"migrated": 0, "failed": 0, "skipped": 0,
+                "in_processing": 0, "rowsAffected": 0}
+
+    now = datetime.utcnow()
+    table = settings.CONTRACT_TABLE
+    migrated = failed = skipped = ip = 0
+
+    with get_connection() as cn:
+        cn.autocommit = False
+        cur = cn.cursor()
+        try:
+            for u in updates:
+                fid = str(u.get("fileID") or "").strip()
+                ui  = (u.get("uiStatus") or "").strip()
+                if not fid or ui not in (
+                    STATUS_IN_PROCESSING, STATUS_MIGRATED, STATUS_FAILED, "Skipped",
+                ):
+                    continue
+
+                backend_status = u.get("backendStatus")
+                file_item_id   = u.get("migrationFileItemId")
+                retry_count    = u.get("retryCount")
+                error_message  = u.get("errorMessage")
+                error_code     = u.get("errorCode")
+                destination_url = u.get("destinationUrl")
+
+                # Terminal states set Migrate/Migrated/MigratedDate; non-
+                # terminal states only refresh backend observation columns.
+                if ui == STATUS_MIGRATED:
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_MIGRATED}', "
+                        f"    [Migrate]                 = 'Yes', "
+                        f"    [Migrated]                = 'True', "
+                        f"    [MigratedDate]            = ?, "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = NULL, "
+                        f"    [ErrorMessage]            = NULL, "
+                        f"    [DestinationUrl]          = COALESCE(?, [DestinationUrl]), "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? "
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        [now, backend_status, file_item_id, retry_count,
+                         destination_url, now, fid],
+                    )
+                    if cur.rowcount:
+                        migrated += cur.rowcount
+
+                elif ui == STATUS_FAILED:
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_FAILED}', "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = ?, "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? "
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        [backend_status, file_item_id, retry_count,
+                         error_code, error_message, now, fid],
+                    )
+                    if cur.rowcount:
+                        failed += cur.rowcount
+
+                elif ui == "Skipped":
+                    # Backend 'skipped' — treat as a distinct terminal state
+                    # (NOT the same as business Excluded per §13).  We fold
+                    # into Failed for the bucket count so the UI identity
+                    # A = B+C+D+E still holds; ErrorMessage explains why.
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_FAILED}', "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationErrorCode]      = COALESCE(?, 'skipped'), "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? "
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        [backend_status, file_item_id, error_code,
+                         error_message or "Skipped by migration backend",
+                         now, fid],
+                    )
+                    if cur.rowcount:
+                        skipped += cur.rowcount
+
+                else:  # In Processing — refresh observation columns only
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = ?, "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? "
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        [backend_status, file_item_id, retry_count,
+                         error_code, error_message, now, fid],
+                    )
+                    if cur.rowcount:
+                        ip += cur.rowcount
+
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
+
+    total = migrated + failed + skipped + ip
+    logger.info(
+        "apply_backend_file_status: migrated=%d failed=%d skipped=%d in_processing=%d total=%d",
+        migrated, failed, skipped, ip, total,
+    )
+    return {
+        "migrated":      migrated,
+        "failed":        failed,
+        "skipped":       skipped,
+        "in_processing": ip,
+        "rowsAffected":  total,
+    }
+
+
+def get_local_ids_for_migration(migration_request_id: str) -> list[dict]:
+    """Return the rows we submitted to a given migration so the sync loop
+    can correlate platform file records back to local FileIDs.
+
+    The platform does NOT round-trip our ``extra_metadata.local_file_id``
+    hint on file records (confirmed live 2026-09-22), so we cannot rely
+    on it inside the sync loop.  Instead we use the mapping we already
+    persisted at submit time in ``record_submission``:
+
+        FileID (local)  →  MigrationFileItemId (platform)  →  SharePointPath
+                                                          →  FileName
+
+    Returns a list of dicts:
+        {
+          "fileID":              "337,514",
+          "migrationFileItemId": "<uuid>" | None,
+          "fileName":            "20220128 notice ....pdf",
+          "sharePointPath":      "https://itellicloud.sharepoint.com/..."
+        }
+
+    Only rows still in an ACTIVE state (In Processing or Failed) are
+    returned — Migrated rows are already terminal and should not be
+    re-touched by the sync loop.
+    """
+    _ensure_schema_once()
+    mid = (migration_request_id or "").strip()
+    if not mid:
+        return []
+    table = settings.CONTRACT_TABLE
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT [FileID], [MigrationFileItemId], [FileName], [SharePointPath] "
+            f"FROM dbo.[{table}] "
+            f"WHERE [MigrationRequestId] = ? "
+            f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+            [mid],
+        )
+        out: list[dict] = []
+        for r in cur.fetchall():
+            out.append({
+                "fileID":              str(r[0]) if r[0] is not None else "",
+                "migrationFileItemId": str(r[1]) if r[1] is not None else "",
+                "fileName":            str(r[2]) if r[2] is not None else "",
+                "sharePointPath":      str(r[3]) if r[3] is not None else "",
+            })
+        return out
+
+
+def active_migration_ids() -> list[str]:
+    """Return the distinct MigrationRequestIds for all rows currently
+    'In Processing'.  Used by /api/migrations/sync to know which
+    migrations to poll.  Deterministic order for logging / tests.
+    """
+    _ensure_schema_once()
+    table = settings.CONTRACT_TABLE
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT DISTINCT [MigrationRequestId] "
+            f"FROM dbo.[{table}] "
+            f"WHERE [MigrationStatus] = '{STATUS_IN_PROCESSING}' "
+            f"  AND [MigrationRequestId] IS NOT NULL "
+            f"ORDER BY [MigrationRequestId]"
+        )
+        return [str(r[0]) for r in cur.fetchall() if r[0]]
+
+
 def get_documents_for_migration(file_ids: Iterable[str]) -> List[dict]:
     """Return the minimal set of fields Power Automate needs to copy each
     file (FileID + FileName + source SharePoint URL + a few metadata bits
@@ -654,12 +1332,14 @@ def mark_excluded(file_ids: Iterable[str],
                   folder_filter_text: str | None = None,
                   folder_filter_mode: str | None = None,
                   matches_by_id: dict[str, dict] | None = None) -> dict:
-    """MOVE the given FileIDs from the active table into the excluded table.
+    """Flag the given FileIDs as `Excluded='Yes'` on the master inventory.
 
-    Transactional:  INSERT into excluded → DELETE from active → COMMIT,
-    followed by INSERTs into `exclusion_audit` (one row per succeeded
-    file) inside the SAME transaction so the move and its audit trail
-    are atomic together.
+    Post-refactor this is a single UPDATE on the master ContractInventory —
+    no more INSERT-into-excluded-table + DELETE-from-active dance.  The row
+    stays exactly where it was; only the exclusion flag + metadata columns
+    change.  The exclusion_audit sidecar continues to record one row per
+    exclusion event so the "who / when / why" history is preserved
+    unchanged.
 
     Optional metadata (all default None for back-compat with the plain
     row-selection Exclude button):
@@ -672,11 +1352,14 @@ def mark_excluded(file_ids: Iterable[str],
                              {"FID123": {"level": "Folder 4", "value": "Services"}}
                              Overrides folder_filter_text when present.
 
-    Business rule: already-migrated rows (Migrate='Yes') are NEVER excluded.
-    They stay in the active table so the migration audit trail is preserved.
+    Eligibility rules (unchanged from the pre-refactor behaviour):
+      * `Migrate='Yes'`         → NEVER excluded (audit trail preservation).
+      * `MigrationStatus = In Processing` → NEVER excluded (must not
+                                            disturb an in-flight copy).
+      * Already `Excluded='Yes'`→ silently skipped (idempotent).
 
-    Never physically deletes anything — the row simply lives in a different
-    table.  Recoverable via restore_excluded().  No SharePoint file touched.
+    Never physically deletes anything.  No SharePoint file touched.
+    Recoverable via restore_excluded().
     """
     _ensure_schema_once()
     ids = [str(i).strip() for i in file_ids if str(i).strip()]
@@ -684,15 +1367,11 @@ def mark_excluded(file_ids: Iterable[str],
         return {"succeeded": [], "failed": [], "rowsAffected": 0}
 
     active = settings.CONTRACT_TABLE
-    ex = excluded_table_name()
-    audit = exclusion_audit_table_name()
+    audit  = exclusion_audit_table_name()
     placeholders = ", ".join("?" for _ in ids)
-    copy_cols = ", ".join(f"[{c}]" for c in _COLUMNS)
 
-    # ExcludedDate is set via SYSUTCDATETIME() (table default) so the DB
-    # is the timestamp source of truth.  We pass ExcludedDate explicitly for
-    # portability: a single SYSUTCDATETIME() call for the whole batch keeps
-    # them all identical (nicer for audit "run" queries).
+    # A single SYSUTCDATETIME() call for the whole batch keeps ExcludedDate
+    # identical across sibling rows (nicer for audit "run" queries).
     now = datetime.utcnow()
     excluded_by = (excluded_by or "").strip() or None
     session_id  = (session_id  or "").strip() or None
@@ -705,27 +1384,28 @@ def mark_excluded(file_ids: Iterable[str],
         cn.autocommit = False
         cur = cn.cursor()
         try:
-            # Step 1 — copy eligible rows into the excluded table.  Skip rows
-            # that are already migrated (business rule), currently 'In Processing'
-            # (must not disturb an in-flight Power Automate copy), or already
-            # excluded (dedup safety).  ExcludedBy captured here so restore
-            # queries can show provenance.
+            # Step 1 — flip Excluded='Yes' on eligible rows.  Guarded WHERE
+            # ensures already-migrated / in-flight / already-excluded rows
+            # are silently skipped (row-count reflects only real transitions).
             cur.execute(
-                f"INSERT INTO dbo.[{ex}] ({copy_cols}, [ExcludedDate], [ExcludedBy]) "
-                f"SELECT {copy_cols}, ?, ? "
-                f"FROM dbo.[{active}] "
+                f"UPDATE dbo.[{active}] "
+                f"SET   [Excluded]     = 'Yes', "
+                f"      [ExcludedDate] = ?, "
+                f"      [ExcludedBy]   = ? "
                 f"WHERE [FileID] IN ({placeholders}) "
-                f"  AND ISNULL([Migrate], 'No') <> 'Yes' "
-                f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') <> '{STATUS_IN_PROCESSING}' "
-                f"  AND [FileID] NOT IN (SELECT [FileID] FROM dbo.[{ex}])",
+                f"  AND ISNULL([Excluded], 'No')       <> 'Yes' "
+                f"  AND ISNULL([Migrate], 'No')        <> 'Yes' "
+                f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') <> "
+                f"      '{STATUS_IN_PROCESSING}'",
                 [now, excluded_by, *ids],
             )
-            copied = cur.rowcount
+            updated = cur.rowcount
 
-            # Step 2 — capture which IDs actually made it into excluded so we
-            # can return an accurate succeeded list AND drive the DELETE.
+            # Step 2 — capture which IDs actually flipped.  Match on the
+            # ExcludedDate stamp we just wrote so we don't accidentally
+            # scoop up rows excluded in a different batch on the same day.
             cur.execute(
-                f"SELECT [FileID], [FileName] FROM dbo.[{ex}] "
+                f"SELECT [FileID], [FileName] FROM dbo.[{active}] "
                 f"WHERE [FileID] IN ({placeholders}) "
                 f"  AND [ExcludedDate] = ?",
                 [*ids, now],
@@ -733,21 +1413,10 @@ def mark_excluded(file_ids: Iterable[str],
             succeeded_rows = [(str(r[0]), _s(r[1])) for r in cur.fetchall()]
             succeeded = [fid for fid, _ in succeeded_rows]
 
-            # Step 3 — delete originals from active (only the ones we
-            # successfully copied).
-            deleted = 0
-            if succeeded:
-                del_ph = ", ".join("?" for _ in succeeded)
-                cur.execute(
-                    f"DELETE FROM dbo.[{active}] WHERE [FileID] IN ({del_ph})",
-                    succeeded,
-                )
-                deleted = cur.rowcount
-
-            # Step 4 — insert one audit row per succeeded file.  Written in
-            # the same transaction so a failed move never leaves an orphan
-            # audit row (and vice-versa).  Manual exclusions pass None for
-            # reason/level/value; the columns are NULLable so that's fine.
+            # Step 3 — write one audit row per succeeded exclusion.  Same
+            # transaction so the flag and its history are atomic.  Payload
+            # shape is unchanged so existing dashboards / reports continue
+            # to work.
             if succeeded_rows:
                 audit_rows = []
                 for fid, fname in succeeded_rows:
@@ -783,29 +1452,33 @@ def mark_excluded(file_ids: Iterable[str],
 
     failed = [i for i in ids if i not in set(succeeded)]
     logger.info(
-        "mark_excluded: requested=%d copied=%d deleted=%d failed=%d by=%s reason=%s",
-        len(ids), copied, deleted, len(failed), excluded_by or "-", reason or "-",
+        "mark_excluded: requested=%d flagged=%d failed=%d by=%s reason=%s",
+        len(ids), updated, len(failed), excluded_by or "-", reason or "-",
     )
     return {
         "succeeded":    succeeded,
         "failed":       failed,
-        "rowsAffected": deleted,
+        "rowsAffected": updated,
     }
 
 
 def restore_excluded(file_ids: Iterable[str],
                      restored_by: str | None = None) -> dict:
-    """MOVE the given FileIDs from the excluded table back into the active table.
+    """Flag the given FileIDs as `Excluded='No'` on the master inventory.
 
-    Transactional:  INSERT into active → DELETE from excluded → COMMIT.
-    Original FileID and all metadata (including Folder1..Folder20) are
-    preserved.  Migration state (Migrate / Migrated / MigratedDate /
-    MigrationStatus) is carried across unchanged so an accidentally-
-    excluded migrated row stays migrated on restore.
+    Post-refactor this is a single UPDATE on the master ContractInventory —
+    no INSERT-into-active + DELETE-from-excluded copy.  The row was never
+    moved in the first place; we simply clear the exclusion flag and its
+    two metadata columns.
 
-    Also stamps `restored_at` + `restored_by` on the MOST RECENT
-    exclusion_audit row per restored file.  The audit row itself is
-    never deleted — history is append-only.
+    The row's business state (MigrationStatus, Migrate, Migrated,
+    MigratedDate, all folder columns, all migration-platform integration
+    columns) is preserved intact — so an accidentally-excluded Migrated
+    row stays Migrated on restore, exactly as before.
+
+    Audit trail: the most-recent un-restored exclusion_audit row per
+    file is stamped with `restored_at` + `restored_by`.  The audit row
+    itself is never deleted — history is append-only.
     """
     _ensure_schema_once()
     ids = [str(i).strip() for i in file_ids if str(i).strip()]
@@ -813,10 +1486,8 @@ def restore_excluded(file_ids: Iterable[str],
         return {"succeeded": [], "failed": [], "rowsAffected": 0}
 
     active = settings.CONTRACT_TABLE
-    ex = excluded_table_name()
-    audit = exclusion_audit_table_name()
+    audit  = exclusion_audit_table_name()
     placeholders = ", ".join("?" for _ in ids)
-    copy_cols = ", ".join(f"[{c}]" for c in _COLUMNS)
     restored_by = (restored_by or "").strip() or None
     now = datetime.utcnow()
 
@@ -824,36 +1495,38 @@ def restore_excluded(file_ids: Iterable[str],
         cn.autocommit = False
         cur = cn.cursor()
         try:
-            # Copy back to active — Excluded flag defaults to 'No', so no
-            # need to set it explicitly.  Dedup against existing active rows.
+            # Step 1 — clear the Excluded flag + metadata.  Only rows that
+            # are currently Excluded='Yes' are touched (idempotent).
             cur.execute(
-                f"INSERT INTO dbo.[{active}] ({copy_cols}) "
-                f"SELECT {copy_cols} FROM dbo.[{ex}] "
+                f"UPDATE dbo.[{active}] "
+                f"SET   [Excluded]     = 'No', "
+                f"      [ExcludedDate] = NULL, "
+                f"      [ExcludedBy]   = NULL "
                 f"WHERE [FileID] IN ({placeholders}) "
-                f"  AND [FileID] NOT IN (SELECT [FileID] FROM dbo.[{active}])",
+                f"  AND ISNULL([Excluded], 'No') = 'Yes'",
                 ids,
             )
-            copied = cur.rowcount
+            updated = cur.rowcount
 
+            # Step 2 — capture which IDs actually flipped (rows that were
+            # Excluded='Yes' before this UPDATE ran).  We probe by looking
+            # for Excluded='No' rows in the id list.  This is a superset of
+            # rows we just updated (unaffected rows were already 'No'),
+            # so we intersect with the input ids to get precise membership.
             cur.execute(
                 f"SELECT [FileID] FROM dbo.[{active}] "
-                f"WHERE [FileID] IN ({placeholders})",
+                f"WHERE [FileID] IN ({placeholders}) "
+                f"  AND ISNULL([Excluded], 'No') = 'No'",
                 ids,
             )
-            succeeded = [str(r[0]) for r in cur.fetchall()]
+            now_no = {str(r[0]) for r in cur.fetchall()}
+            succeeded = [fid for fid in ids if fid in now_no]
 
-            deleted = 0
+            # Step 3 — stamp `restored_at` + `restored_by` on the newest
+            # un-restored audit row per succeeded file (unchanged from
+            # pre-refactor).
             if succeeded:
                 del_ph = ", ".join("?" for _ in succeeded)
-                cur.execute(
-                    f"DELETE FROM dbo.[{ex}] WHERE [FileID] IN ({del_ph})",
-                    succeeded,
-                )
-                deleted = cur.rowcount
-
-                # Stamp the most recent audit row per restored file.
-                # Uses a correlated subquery to target the newest un-restored
-                # exclusion event; older events remain as-is.
                 cur.execute(
                     f"UPDATE a SET a.restored_at = ?, a.restored_by = ? "
                     f"FROM dbo.[{audit}] a "
@@ -872,13 +1545,17 @@ def restore_excluded(file_ids: Iterable[str],
         finally:
             cn.autocommit = True
 
+    # `succeeded` is the intersection of input ids and rows currently
+    # Excluded='No'.  A row that was already 'No' before we ran also lands
+    # here — that's fine (it means "the request is satisfied").  `failed`
+    # captures anything that stayed excluded despite being requested.
     failed = [i for i in ids if i not in set(succeeded)]
     logger.info(
-        "restore_excluded: requested=%d copied=%d deleted=%d failed=%d by=%s",
-        len(ids), copied, deleted, len(failed), restored_by or "-",
+        "restore_excluded: requested=%d flagged_off=%d failed=%d by=%s",
+        len(ids), updated, len(failed), restored_by or "-",
     )
     return {
         "succeeded":    succeeded,
         "failed":       failed,
-        "rowsAffected": deleted,
+        "rowsAffected": updated,
     }

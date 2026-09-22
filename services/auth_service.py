@@ -1,4 +1,4 @@
-"""Lightweight shared-password login + session tracking.
+"""Lightweight email-only login + session tracking.
 
 Purpose (see task spec §13):
     • identify the current user by company email
@@ -7,26 +7,19 @@ Purpose (see task spec §13):
     • track logins/logouts in the `user_sessions` table
 
 Non-goals: this is NOT an authentication system.  No registration, no
-password reset, no roles, no MFA.  One shared password unlocks any
-valid `@bs.nttdata.com` (configurable) email.
+roles, no MFA.  Password-based login was removed at product request —
+any well-formed `@bs.nttdata.com` (configurable) email creates a session.
 
 Public API
 ──────────
     validate_email_domain(email)  -> (ok, normalized_email_or_error)
-    verify_shared_password(pwd)   -> bool
     create_session(email, ua, ip) -> session_id (str)
     get_session(session_id)       -> dict | None   (fresh from DB)
     touch_session(session_id)     -> None          (bumps last_activity)
     end_session(session_id)       -> bool          (marks inactive + logout_time)
-
-The shared password is compared with `hmac.compare_digest` to avoid the
-tiny leak of Python's short-circuit string equality.  Password is loaded
-from `settings.APP_SHARED_PASSWORD` and is never logged or returned to
-the client.
 """
 from __future__ import annotations
 
-import hmac
 import logging
 import re
 import secrets
@@ -92,19 +85,6 @@ def validate_email_domain(email: str) -> Tuple[bool, str]:
     # Normalize: keep local-part as typed (case may matter for display),
     # lower-case the domain half so DB rows are consistent.
     return True, f"{local}@{domain.lower()}"
-
-
-def verify_shared_password(password: str) -> bool:
-    """Constant-time compare against the configured shared password."""
-    if not isinstance(password, str) or not password:
-        return False
-    expected = settings.APP_SHARED_PASSWORD or ""
-    if not expected:
-        # Refuse to authenticate if no password is configured at all
-        # (defence-in-depth against accidental empty env var).
-        logger.error("APP_SHARED_PASSWORD is empty — refusing login.")
-        return False
-    return hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8"))
 
 
 # ── Session lifecycle ──────────────────────────────────────────────────────

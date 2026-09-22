@@ -1,7 +1,18 @@
-fastapi
-uvicorn[standard]
-jinja2
-pandas
-aiofiles
-pyodbc
-python-dotenv
+# Pin the web-framework stack so Azure App Service builds match local dev.
+# The TemplateResponse signature changed in Starlette 0.29 (request became
+# the first positional arg); pinning avoids surprise breakage on redeploy.
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30,<0.35
+starlette>=0.38,<0.42
+jinja2>=3.1,<4
+pandas>=2.0
+aiofiles>=23.0
+pyodbc>=5.0
+python-dotenv>=1.0
+certifi>=2024.0.0
+# Migration platform DB (PostgreSQL, authoritative per-file status source).
+# Used by services/migration_platform_db.py.  psycopg_pool gives us a
+# lazy connection pool so per-sync-tick batch reads reuse sockets instead
+# of paying the TLS handshake cost every 8 seconds.
+psycopg[binary]>=3.1
+psycopg_pool>=3.2

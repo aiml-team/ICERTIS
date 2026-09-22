@@ -1,14 +1,17 @@
-"""Authentication endpoints — shared-password login + session tracking.
+"""Authentication endpoints — email-only login + session tracking.
 
-    POST /api/auth/login    → validate email domain + shared password,
+    POST /api/auth/login    → validate email format + company domain,
                               issue an HttpOnly session cookie, insert a
-                              row in `user_sessions`.
+                              row in `user_sessions`.  NO password required.
     POST /api/auth/logout   → deactivate the current session row and
                               clear the cookie.
     GET  /api/auth/me       → return `{ email, sessionId }` for the
                               currently-authenticated caller (used by
                               the frontend to show the user's identity
                               in the header).
+
+Password-based login was removed at product request for this internal
+app — the session is now created solely from the user's email address.
 
 Also exports the `require_session` dependency used by protected routes:
 
@@ -35,8 +38,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 # ── Request/response shapes ────────────────────────────────────────────────
 class LoginRequest(BaseModel):
-    email:    str = Field(..., description="Company email address")
-    password: str = Field(..., description="Shared application password")
+    email: str = Field(..., description="Company email address")
 
 
 class LoginResponse(BaseModel):
@@ -90,31 +92,26 @@ def require_session(request: Request) -> dict:
 # ── Endpoints ──────────────────────────────────────────────────────────────
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest, request: Request, response: Response):
-    """Validate email + shared password, then create a new session.
+    """Validate email format + company domain, then create a new session.
+
+    Password-based login was removed at product request — this route is
+    now email-only.  Access control is still non-anonymous because:
+      • the email must be well-formed, and
+      • it must belong to the configured company domain.
 
     Response semantics:
       • 200 → session issued; HttpOnly cookie set on the response.
-      • 400 → email is not from the configured company domain
-              (message names the domain so users know what to fix).
-      • 401 → wrong shared password.
-
-    Deliberately non-descriptive on the 401 path — we never reveal that
-    the email itself was "valid".
+      • 400 → email is missing / malformed / not on the company domain
+              (the message names the required domain so users know what
+              to fix).
     """
-    # 1. Email format + exact company-domain check.
+    # 1. Email format + exact company-domain check (backend is authoritative).
     ok, normalized_or_error = auth_service.validate_email_domain(payload.email)
     if not ok:
         raise HTTPException(status_code=400, detail=normalized_or_error)
     email = normalized_or_error
 
-    # 2. Shared password (constant-time compare).
-    if not auth_service.verify_shared_password(payload.password):
-        # NEVER log the password.  Log the email + IP for audit.
-        logger.info("Login rejected (bad password) for %s from %s",
-                    email, request.client.host if request.client else "?")
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-    # 3. Create the session row + set the cookie.
+    # 2. Create the session row + set the cookie.
     ua = (request.headers.get("user-agent") or "")[:512]
     ip = request.client.host if request.client else ""
     session_id = auth_service.create_session(email, user_agent=ua, remote_ip=ip)
