@@ -923,17 +923,92 @@ html, body {
   text-overflow: ellipsis;
   max-width: 0;
   vertical-align: middle;
+  /* Opaque default background so sticky/frozen cells occlude cleanly when
+     the table is scrolled horizontally.  Row-state variants below re-tint
+     the whole row uniformly. */
+  background-color: #ffffff;
 }
 
-/* frozen body cells */
+/* Row-state backgrounds applied per-cell (rather than on <tr>) so they
+   also cover the sticky/frozen cells and so scrolled-under cells cannot
+   bleed through the ones that appear stationary. */
+.excel-table tbody tr:hover td {
+  background-color: #f0f7ff;
+}
+.excel-table tbody tr.row-selected td {
+  background-color: #eff6ff;
+}
+.excel-table tbody tr.row-selected:hover td {
+  background-color: #e0efff;
+}
+.excel-table tbody tr.row-migrated td {
+  background-color: #f0fdf4;
+}
+.excel-table tbody tr.row-migrated:hover td {
+  background-color: #dcfce7;
+}
+.excel-table tbody tr.row-in-processing td {
+  background-color: #faf5ff;
+}
+.excel-table tbody tr.row-in-processing:hover td {
+  background-color: #f3ecfe;
+}
+.excel-table tbody tr.row-folder-match td {
+  background-color: #f2f5fb;
+}
+.excel-table tbody tr.row-folder-match:hover td {
+  background-color: #e6effa;
+}
+
+/* Frozen body cells.
+   IMPORTANT: sticky cells MUST have an opaque background-color, otherwise
+   the horizontally-scrolled cells behind them bleed through and cause the
+   apparent "row content overlap" visible when the table is scrolled right.
+   `background: inherit` looks correct but on <td> it resolves to
+   transparent in most browsers (the <tr> background paints on the row box,
+   not on each cell), so we must set an explicit background-color per
+   row-state variant below. */
 .excel-table tbody td.col-frozen {
-  background: inherit;
+  background-color: #ffffff;
   z-index: 10;
 }
 
-.excel-table tbody tr:hover td.col-frozen,
+.excel-table tbody tr:hover td.col-frozen {
+  background-color: #f0f7ff;
+}
+
 .excel-table tbody tr.row-selected td.col-frozen {
-  background: inherit;
+  background-color: #eff6ff;
+}
+
+.excel-table tbody tr.row-selected:hover td.col-frozen {
+  background-color: #e0efff;
+}
+
+.excel-table tbody tr.row-migrated td.col-frozen {
+  background-color: #f0fdf4;
+}
+
+.excel-table tbody tr.row-migrated:hover td.col-frozen {
+  background-color: #dcfce7;
+}
+
+.excel-table tbody tr.row-in-processing td.col-frozen {
+  background-color: #faf5ff;
+}
+
+.excel-table tbody tr.row-in-processing:hover td.col-frozen {
+  background-color: #f3ecfe;
+}
+
+/* row-folder-match uses a linear-gradient tint (~5% blue over white) which
+   resolves to roughly #f2f5fb; hover blends into the shared hover tint. */
+.excel-table tbody tr.row-folder-match td.col-frozen {
+  background-color: #f2f5fb;
+}
+
+.excel-table tbody tr.row-folder-match:hover td.col-frozen {
+  background-color: #e6effa;
 }
 
 /* ── Special column widths ─────────────────────────────────────────────── */
@@ -1043,6 +1118,42 @@ thead .cell-rn {
 }
 
 .cell-empty { color: #d1d5db; }
+
+/* ── Single-line ellipsis wrapper ──────────────────────────────────────────
+ * Applied to every cell content wrapper (fileName, sharePointPath, folder
+ * columns, generic long text).  The parent <td> already sets
+ * `overflow:hidden` and a fixed width, but inline anchors/spans need this
+ * block treatment so `text-overflow:ellipsis` can actually render the
+ * three-dot glyph instead of the parent just pixel-clipping the tail.
+ * ──────────────────────────────────────────────────────────────────────── */
+.cell-clip {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* File-name cell contains only the hyperlink (or plain span) rendered
+ * inline with the shared .cell-clip ellipsis pattern.  The old
+ * .cell-filename wrapper that stacked a match badge below the filename has
+ * been removed — the matched-folder indicator is now shown in a dedicated
+ * conditional "Matched Folder" column instead (see .th-virtual rule
+ * below), so the File Name cell stays a clean single-line ellipsis. */
+
+/* Header cell for the virtual "Matched Folder" column — visually identical
+ * to normal headers but with no filter/resize affordances, and a faint
+ * left border so users can see it's a computed column that appears only
+ * while the Folder Filter is active. */
+.excel-table th.th-virtual {
+  border-left: 2px solid #93c5fd;
+  background: #f0f7ff;
+  cursor: default;
+}
+.excel-table th.th-virtual .th-label {
+  color: #1e40af;
+  font-style: italic;
+}
 
 /* ── Missing fields chips ──────────────────────────────────────────────── */
 .mf-chip {
@@ -1429,6 +1540,193 @@ thead .cell-rn {
   height: 13px;
   accent-color: #0f6cbd;
   cursor: pointer;
+}
+
+/* ── Column-picker group headings (§17 SharePoint Hierarchy grouping) ─── */
+.colpanel-group + .colpanel-group { border-top: 1px solid #eef2f7; margin-top: 4px; padding-top: 4px; }
+
+.colpanel-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px 4px;
+  font-weight: 700;
+  font-size: 10.5px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.colpanel-group-actions { display: inline-flex; gap: 6px; }
+
+.colpanel-group-btn {
+  background: transparent;
+  border: none;
+  color: #0f6cbd;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.colpanel-group-btn:hover { text-decoration: underline; }
+
+/* ── Global folder-filter popover (Philippe requirement) ────────────────
+ * Reuses the .col-btn-wrap positioning pattern.  Opens under the toolbar
+ * button; contains a text input, match-mode dropdown and Apply/Clear.
+ * Distinct from the folder navigator which browses a single subtree. */
+.folder-filter-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 9500;
+  width: 320px;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+  padding: 12px 14px 12px;
+  font-size: 12px;
+}
+
+.folder-filter-head {
+  font-weight: 700;
+  font-size: 10.5px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 8px;
+}
+
+.folder-filter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.folder-filter-row label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.folder-filter-input,
+.folder-filter-select {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #111827;
+  background: #fff;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.folder-filter-input:focus,
+.folder-filter-select:focus {
+  outline: none;
+  border-color: #0f6cbd;
+  box-shadow: 0 0 0 2px rgba(15, 108, 189, 0.15);
+}
+
+.folder-filter-hint {
+  font-size: 10.5px;
+  color: #6b7280;
+  line-height: 1.4;
+  margin: -4px 0 10px;
+}
+
+.folder-filter-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.folder-filter-apply {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid #0a57a0;
+  border-radius: 5px;
+  background: #0f6cbd;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.folder-filter-apply:hover { background: #0a5099; }
+
+.folder-filter-clear {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  background: #fff;
+  color: #374151;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.folder-filter-clear:hover { background: #f3f4f6; border-color: #9ca3af; }
+
+/* Active-state visual on the toolbar button when a filter is applied. */
+#folder-filter-btn.has-selection {
+  border-color: #0f6cbd;
+  background: #eff6ff;
+  color: #0a57a0;
+}
+
+/* Chip in the .af-bar showing the active folder filter — clicking × clears it. */
+.af-chip.af-chip-folder {
+  background: #eef4ff;
+  border-color: #c7d7f5;
+  color: #1e40af;
+}
+
+/* Faint tint on rows returned via the folder filter (helps orient the user
+ * when the matched folder column is not currently visible). */
+.excel-table tbody tr.row-folder-match {
+  background: linear-gradient(0deg, rgba(15,108,189,0.05), rgba(15,108,189,0.05)) !important;
+}
+
+/* Inline "matched folder" badge shown next to the file name when the
+ * global folder filter is what surfaced this row.  Compact & muted so
+ * it doesn't compete with real filename text. */
+/* Compact pill used as the value of the virtual "Matched Folder" column.
+ * Sized to fit inside the 170px column with ellipsis for long folder names.
+ * .cell-clip on the same element handles the overflow/ellipsis. */
+.cell-folder-match {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: #eef4ff;
+  border: 1px solid #c7d7f5;
+  color: #1e40af;
+  font-size: 10.5px;
+  line-height: 1.5;
+  font-weight: 600;
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Highlight the specific Folder N cell that matched. */
+.cell-folder-hit {
+  background: #fef3c7;
+  border-radius: 2px;
+  padding: 1px 4px;
+  font-weight: 600;
+  color: #78350f;
 }
 
 /* ── Migration modal ───────────────────────────────────────────────────── */

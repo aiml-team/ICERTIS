@@ -247,6 +247,112 @@ def ensure_migration_status_column() -> None:
         cn.commit()
 
 
+# ── Folder-hierarchy columns (SharePoint path decomposition) ───────────────
+# Philippe requirement: expose each SharePoint folder level as a discrete
+# structured field (Folder1..Folder20) so a global "folder contains" search
+# can hit any level without the user knowing the depth.  These columns are
+# ADDITIVE: SharePointPath remains the source of truth; Folder1..Folder20
+# are derived from it (Python parser matches the client _folderSegmentsFor
+# so client & server stay 1:1).
+#
+# The columns are added lazily by ensure_folder_columns() to both tables and
+# are backfilled from SharePointPath on first run.  Blank levels are stored
+# as NULL — never a synthesised placeholder.
+FOLDER_LEVEL_MAX = 20
+
+
+def _folder_columns_sql(indent: str = "        ") -> str:
+    """Return CREATE TABLE fragment for Folder1..Folder20 NVARCHAR(256) NULL."""
+    return ",\n".join(
+        f"{indent}Folder{i:02d}              NVARCHAR(256) NULL"
+        for i in range(1, FOLDER_LEVEL_MAX + 1)
+    )
+
+
+_ADD_FOLDER_COLUMNS_DDL_TEMPLATE = """
+DECLARE @sql NVARCHAR(MAX) = N'';
+{add_blocks}
+IF LEN(@sql) > 0 EXEC(@sql);
+"""
+
+
+def _add_folder_columns_ddl(table: str) -> str:
+    """Build an idempotent multi-ALTER that appends every missing Folder<N>
+    column in a single dynamic-SQL batch.  Existing columns are left alone."""
+    blocks = []
+    for i in range(1, FOLDER_LEVEL_MAX + 1):
+        col = f"Folder{i:02d}"
+        blocks.append(
+            f"IF NOT EXISTS (SELECT 1 FROM sys.columns "
+            f"WHERE Name = N'{col}' AND Object_ID = Object_ID(N'dbo.[{table}]')) "
+            f"SET @sql = @sql + N'ALTER TABLE dbo.[{table}] ADD [{col}] NVARCHAR(256) NULL; ';"
+        )
+    return _ADD_FOLDER_COLUMNS_DDL_TEMPLATE.format(add_blocks="\n".join(blocks))
+
+
+def ensure_folder_columns() -> None:
+    """Idempotent: add Folder1..Folder20 to both active + excluded tables.
+
+    Backfill is done in Python by services.data_service.backfill_folder_columns()
+    on the first schema-check pass because the parser must match the client
+    (which strips technical segments like 'Shared Documents' and the trailing
+    file name).  Doing the parse in Python keeps the two implementations in
+    lockstep instead of having to maintain a T-SQL twin.
+    """
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(_add_folder_columns_ddl(settings.CONTRACT_TABLE))
+        cur.execute(_add_folder_columns_ddl(excluded_table_name()))
+        cn.commit()
+
+
+# ── Exclusion audit sidecar ────────────────────────────────────────────────
+# One row per exclusion event.  Never deleted on restore — the row is left
+# in place and marked with a RestoredAt/RestoredBy pair so we always have
+# the full history "who excluded this file, when, and (if applicable) why".
+#
+# The `reason` and matched-folder columns are optional; manual exclusions
+# (row-selection Exclude button) write NULLs for those fields.
+_EXCLUSION_AUDIT_TABLE = "exclusion_audit"
+
+_EXCLUSION_AUDIT_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables WHERE name = '{table}' AND schema_id = SCHEMA_ID('dbo')
+)
+BEGIN
+    CREATE TABLE dbo.[{table}] (
+        id                   BIGINT        IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        file_id              NVARCHAR(64)  NOT NULL,
+        file_name            NVARCHAR(512) NULL,
+        excluded_at          DATETIME2     NOT NULL CONSTRAINT DF_{table}_at  DEFAULT SYSUTCDATETIME(),
+        excluded_by          NVARCHAR(256) NULL,
+        session_id           NVARCHAR(128) NULL,
+        reason               NVARCHAR(128) NULL,
+        matched_folder_level NVARCHAR(32)  NULL,
+        matched_folder_value NVARCHAR(256) NULL,
+        folder_filter_text   NVARCHAR(256) NULL,
+        folder_filter_mode   NVARCHAR(32)  NULL,
+        restored_at          DATETIME2     NULL,
+        restored_by          NVARCHAR(256) NULL
+    );
+    CREATE INDEX IX_{table}_file_id ON dbo.[{table}](file_id);
+END
+"""
+
+
+def exclusion_audit_table_name() -> str:
+    return _EXCLUSION_AUDIT_TABLE
+
+
+def ensure_exclusion_audit_table() -> None:
+    """Idempotent create of the exclusion_audit sidecar table."""
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(_EXCLUSION_AUDIT_DDL.format(table=_EXCLUSION_AUDIT_TABLE))
+        cn.commit()
+    logger.info("Schema ensured for table dbo.%s", _EXCLUSION_AUDIT_TABLE)
+
+
 # ── User-session tracking table ────────────────────────────────────────────
 # Lightweight table populated by the shared-password login layer.  Its ONLY
 # purpose is to know which company email owns the current session id and to

@@ -22,11 +22,12 @@ Exclusion is a **recoverable soft-delete**: the row is moved into
 `ContractInventory_Excluded` (transactional) and can be restored later.
 No SharePoint file is ever deleted.
 """
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from routes.auth import require_session
 from services import power_automate
 from services.data_service import (
     apply_migration_result,
@@ -47,9 +48,26 @@ class MigrateRequest(BaseModel):
                            description="FileIDs selected for migration")
 
 
+class FolderMatch(BaseModel):
+    """Per-file audit detail describing which folder level matched the
+    global folder filter that triggered a bulk exclusion."""
+    level: str = Field(..., description="Human label, e.g. 'Folder 4'")
+    value: str = Field(..., description="The segment value that matched, e.g. 'Services'")
+
+
 class ExcludeRequest(BaseModel):
     ids: List[str] = Field(..., min_length=1,
                            description="FileIDs to move into the excluded table")
+    # ── Optional folder-filter audit metadata (all default to None so the
+    # existing row-selection Exclude button keeps working unchanged). ──
+    reason:           Optional[str]                       = Field(
+        None, description="Short label, e.g. 'Matched folder filter'")
+    folderFilterText: Optional[str]                       = Field(
+        None, description="The search text the user typed in the folder filter")
+    folderFilterMode: Optional[str]                       = Field(
+        None, description="'contains' | 'starts_with' | 'exact'")
+    matches:          Optional[Dict[str, FolderMatch]]    = Field(
+        None, description="fileID -> matched folder level/value (per-file)")
 
 
 class RestoreRequest(BaseModel):
@@ -242,25 +260,55 @@ def migrate_callback(payload: MigrateCallbackRequest):
 
 
 @router.post("/exclude")
-def exclude_contracts(payload: ExcludeRequest):
+def exclude_contracts(payload: ExcludeRequest,
+                      session: dict = Depends(require_session)):
     """MOVE the given FileIDs into the excluded table (transactional).
 
     Already-migrated rows and rows currently In Processing are skipped by
     the service layer — they cannot be excluded.  No SharePoint file is
     affected.
+
+    Audit: `excluded_by` and `session_id` are pulled from the current
+    login session so the caller never has to (and cannot) spoof them.
+    The optional folder-filter metadata (`reason`, `folderFilterText`,
+    `folderFilterMode`, `matches`) is persisted verbatim into the
+    exclusion_audit table.
     """
     try:
-        result = mark_excluded(payload.ids)
+        matches = None
+        if payload.matches:
+            # Pydantic v2 returns FolderMatch models; convert to plain dicts
+            # the service layer can index by fileID.
+            matches = {
+                fid: {"level": m.level, "value": m.value}
+                for fid, m in payload.matches.items()
+            }
+        result = mark_excluded(
+            payload.ids,
+            excluded_by        = session.get("email"),
+            session_id         = session.get("session_id"),
+            reason             = payload.reason,
+            folder_filter_text = payload.folderFilterText,
+            folder_filter_mode = payload.folderFilterMode,
+            matches_by_id      = matches,
+        )
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Exclusion update failed: {exc}")
 
 
 @router.post("/restore")
-def restore_excluded_contracts(payload: RestoreRequest):
-    """MOVE the given FileIDs back into the active table (transactional)."""
+def restore_excluded_contracts(payload: RestoreRequest,
+                               session: dict = Depends(require_session)):
+    """MOVE the given FileIDs back into the active table (transactional).
+
+    Also stamps `restored_at`/`restored_by` on the most-recent unrestored
+    exclusion_audit row per file (append-only history)."""
     try:
-        result = restore_excluded(payload.ids)
+        result = restore_excluded(
+            payload.ids,
+            restored_by=session.get("email"),
+        )
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Restore failed: {exc}")

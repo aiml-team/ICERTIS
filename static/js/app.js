@@ -1,6 +1,8 @@
 /* ── Column definitions ─────────────────────────────────────────────────── */
+// Every column carries an optional `group` tag used ONLY by the Columns
+// picker to render section headings.  Untagged columns fall under "General".
 const COL_CFG = [
-  { f: 'fileName',               h: 'File Name',           ft: 'text', w: 260 },
+  { f: 'fileName',               h: 'File Name',           ft: 'text', w: 320 },
   { f: 'customerName',           h: 'Customer Name',       ft: 'text', w: 170 },
   { f: 'agreementName',          h: 'Agreement Name',      ft: 'text', w: 210 },
   { f: 'contractType',           h: 'Contract Type',       ft: 'text', w: 120 },
@@ -31,6 +33,29 @@ const COL_CFG = [
   { f: 'sharePointPath',         h: 'SharePoint Path',     ft: 'text', w: 300, hide: true },
 ];
 
+// ── SharePoint hierarchy columns (Folder 1..20) ─────────────────────────
+// Persisted server-side (dbo.ContractInventory.Folder01..Folder20) and
+// exposed under a dedicated group so the Columns picker can render them
+// as a separate section.  Only Folder 1-4 are visible by default —
+// SharePoint paths rarely go deeper for the common workflow, and
+// showing all 20 would make the table unusably wide.
+const FOLDER_LEVEL_MAX = 20;
+const FOLDER_DEFAULT_VISIBLE = 4;   // Folders 1..4 visible by default
+for (let i = 1; i <= FOLDER_LEVEL_MAX; i++) {
+  COL_CFG.push({
+    f:      `folder${i}`,
+    h:      `Folder ${i}`,
+    ft:     'text',
+    w:      140,
+    hide:   i > FOLDER_DEFAULT_VISIBLE,
+    group:  'SharePoint Hierarchy',
+  });
+}
+// Fields (in addition to SEARCHABLE) the folder filter scans.  Order is
+// preserved so the "Matched: Folder N = value" tooltip picks the shallowest
+// matching level first (matches user intuition — top of the tree wins).
+const FOLDER_FIELDS = Array.from({length: FOLDER_LEVEL_MAX}, (_, i) => `folder${i + 1}`);
+
 const SEARCHABLE = ['fileName','customerName','agreementName','opportunityID','ae','contractType','contractClassification','legalEntity'];
 
 /* ── State ──────────────────────────────────────────────────────────────── */
@@ -55,6 +80,17 @@ const state = {
   // 'selected' bucket was removed from the KPI row; the value 'selected'
   // is retained here only as legacy no-op to keep older bookmarks safe.
   bucketFilter:     'all',
+  // ── Global folder filter (Philippe requirement) ───────────────────────
+  // Searches across folder1..folder20 for ALL rows regardless of the
+  // folder navigator's current scope.  When active, applyFiltersAndSort()
+  // scans every level and annotates each returned row with __folderMatch
+  // = { level: 'Folder 4', value: 'Services' } so the UI can render a
+  // tooltip / chip explaining why the row is present.  Cleared by the
+  // Clear Filters button along with all other filters.
+  folderFilter: {
+    text: '',                      // user's raw search text (trimmed)
+    mode: 'contains',              // 'contains' | 'starts_with' | 'exact'
+  },
   // records fetched from the database via /api/contracts on Start
   sourceData:       [],
   sourceCount:      0,
@@ -383,13 +419,72 @@ function _rowInSelectedFolder(row) {
   return keys.has(state.folderPath.join('/'));
 }
 
+/* ── Global folder filter helpers ─────────────────────────────────────────
+ * The folder filter scans folder1..folder20 for a match under the chosen
+ * mode.  When it fires for a row, we stash __folderMatch on that row so
+ * the UI can (a) render a tooltip / info chip explaining the match and
+ * (b) build a per-file matches map when the user bulk-excludes the
+ * filtered set (audit persistence in dbo.exclusion_audit).
+ * ──────────────────────────────────────────────────────────────────────── */
+function _folderFilterMatcher(text, mode) {
+  const needle = (text || '').trim().toLowerCase();
+  if (!needle) return null;
+  switch (mode) {
+    case 'starts_with':
+      return (v) => v.toLowerCase().startsWith(needle);
+    case 'exact':
+      return (v) => v.toLowerCase() === needle;
+    case 'contains':
+    default:
+      return (v) => v.toLowerCase().includes(needle);
+  }
+}
+
+/** Return {level, value} of the SHALLOWEST folder that matches, or null. */
+function _matchFolderInRow(row, match) {
+  for (let i = 0; i < FOLDER_FIELDS.length; i++) {
+    const v = row[FOLDER_FIELDS[i]];
+    if (v && match(String(v))) {
+      return { level: `Folder ${i + 1}`, value: String(v) };
+    }
+  }
+  return null;
+}
+
+function isFolderFilterActive() {
+  return !!(state.folderFilter && state.folderFilter.text && state.folderFilter.text.trim());
+}
+
 function applyFiltersAndSort() {
   let d = state.allData;
+
+  // Clear last pass's per-row folder-match annotation.  We re-annotate
+  // below only for rows that the folder filter actually returns.
+  for (const r of state.allData) { if (r.__folderMatch) delete r.__folderMatch; }
 
   // Folder scope: applied FIRST so column-filter dropdowns show values that
   // are consistent with the currently-visible subtree.  Empty path = no-op.
   if (state.folderPath.length) {
     d = d.filter(_rowInSelectedFolder);
+  }
+
+  // Global folder filter (Philippe): applied AFTER the navigator scope so
+  // narrowing the tree can further constrain results, but the filter
+  // itself still scans across ALL folder levels.  Rows that match get a
+  // __folderMatch annotation for tooltip + audit.
+  if (isFolderFilterActive()) {
+    const match = _folderFilterMatcher(state.folderFilter.text, state.folderFilter.mode);
+    if (match) {
+      const survivors = [];
+      for (const r of d) {
+        const m = _matchFolderInRow(r, match);
+        if (m) {
+          r.__folderMatch = m;
+          survivors.push(r);
+        }
+      }
+      d = survivors;
+    }
   }
 
   // Bucket filter (migration status): applied first so column filters still narrow further
@@ -471,10 +566,41 @@ function renderCell(row, col) {
   if (col.f === 'fileName') {
     const path = row.sharePointPath;
     const display = esc(str) || '—';
+    // Full name + matched-folder info kept in the tooltip so the reason
+    // is discoverable even when the dedicated "Matched Folder" column is
+    // scrolled off-screen.  Visible matched-folder chip is rendered in
+    // its own column (see the virtual "__matchedFolder" col below) so the
+    // File Name cell can stay a clean single-line ellipsis.
+    const fm = row.__folderMatch;
+    const tipBase = str || '';
+    const tip = fm ? `${tipBase}\nMatched: ${fm.level} = ${fm.value}` : tipBase;
     if (path && path.startsWith('http')) {
-      return `<a class="cell-link" href="${esc(path)}" target="_blank" rel="noopener noreferrer" title="${esc(str)}">${display} <span class="cell-link-icon">&#8599;</span></a>`;
+      return `<a class="cell-link cell-clip" href="${esc(path)}" target="_blank" rel="noopener noreferrer" title="${esc(tip)}">${display}<span class="cell-link-icon">&#8599;</span></a>`;
     }
-    return `<span title="${esc(str)}">${display}</span>`;
+    return `<span class="cell-clip" title="${esc(tip)}">${display}</span>`;
+  }
+
+  // Virtual "Matched Folder" column — injected by getVisibleCols() only
+  // while the global folder filter is active.  Not in COL_CFG, so it is
+  // never exported, never sortable, never filterable, never picker-listed.
+  if (col.f === '__matchedFolder') {
+    const fm = row.__folderMatch;
+    if (!fm) return '<span class="cell-empty">—</span>';
+    const label = `${fm.level}: ${fm.value}`;
+    return `<span class="cell-folder-match cell-clip" title="${esc(label)}">${esc(label)}</span>`;
+  }
+
+  // Folder columns — mild highlight when this specific level is the one
+  // the folder filter matched, so the user can see immediately which
+  // cell caused the row to be present.
+  if (col.group === 'SharePoint Hierarchy') {
+    if (!str) return '<span class="cell-empty">—</span>';
+    const fm = row.__folderMatch;
+    const isMatchCol = fm && fm.level.toLowerCase() === col.h.toLowerCase();
+    if (isMatchCol) {
+      return `<span class="cell-folder-hit cell-clip" title="Matched by folder filter: ${esc(str)}">${esc(str)}</span>`;
+    }
+    return `<span class="cell-clip" title="${esc(str)}">${esc(str)}</span>`;
   }
 
   if (col.f === 'missingFields' && str) {
@@ -503,22 +629,44 @@ function renderCell(row, col) {
       // SharePoint URLs in the source are already percent-encoded (spaces as %20).
       // Only encode raw spaces if any slipped through; DO NOT re-encode existing % sequences.
       const href = str.replace(/ /g, '%20');
-      return `<a class="cell-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(str)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(str)}</a>`;
+      return `<a class="cell-link cell-clip" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(str)}">${esc(str)}</a>`;
     }
     // Fall through for non-URL values so they render as plain truncated text.
   }
 
   const longFields = ['sharePointPath','errorMessage','agreementName','associatedMSAFileName','associatedNDAFileName','runId'];
   if (longFields.includes(col.f)) {
-    return `<span title="${esc(str)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">${esc(str)}</span>`;
+    return `<span class="cell-clip" title="${esc(str)}">${esc(str)}</span>`;
   }
 
-  return `<span title="${esc(str)}">${esc(str)}</span>`;
+  return `<span class="cell-clip" title="${esc(str)}">${esc(str)}</span>`;
 }
 
 /* ── Table render ───────────────────────────────────────────────────────── */
+// Virtual "Matched Folder" pseudo-column definition.  Injected into the
+// visible-columns list ONLY while the global folder filter is active so the
+// per-row matched level+value is visible without crowding the File Name
+// cell.  Not in COL_CFG — that means it is automatically absent from the
+// Columns picker, sort/filter menus, Export CSV, resize memory, etc.
+const MATCHED_FOLDER_COL = {
+  f:        '__matchedFolder',
+  h:        'Matched Folder',
+  ft:       'text',
+  w:        170,
+  virtual:  true,   // never persisted, never exported, never filterable
+};
+
 function getVisibleCols() {
-  return COL_CFG.filter(c => !state.hiddenCols.has(c.f));
+  const base = COL_CFG.filter(c => !state.hiddenCols.has(c.f));
+  // Inject the virtual "Matched Folder" column immediately after File Name
+  // when the global folder filter is active.  If File Name is hidden for
+  // some reason, prepend it so the info is still visible.
+  if (isFolderFilterActive()) {
+    const fnIdx = base.findIndex(c => c.f === 'fileName');
+    if (fnIdx >= 0) base.splice(fnIdx + 1, 0, MATCHED_FOLDER_COL);
+    else            base.unshift(MATCHED_FOLDER_COL);
+  }
+  return base;
 }
 
 function renderTable() {
@@ -535,6 +683,17 @@ function renderTable() {
     const isFirst = idx === 0;
     const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
     const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:15;background:#eaeff5;' : '';
+    // Virtual columns (e.g. "Matched Folder") get a stripped-down header:
+    // no filter button, no resize handle, no sort click — they are not
+    // backed by a real data field.
+    if (col.virtual) {
+      thead += `<th class="th-virtual" style="${frozenStyle}width:${w}px;min-width:${w}px;max-width:${w}px" data-field="${col.f}" title="Automatically shown while the Folder Filter is active">
+        <div class="th-inner">
+          <span class="th-label">${esc(col.h)}</span>
+        </div>
+      </th>`;
+      return;
+    }
     const hasFilter = !!state.columnFilters[col.f];
     const filterActive = hasFilter ? 'active' : '';
     const sortIcon = state.sortCol === col.f
@@ -572,6 +731,8 @@ function renderTable() {
         isSelected      ? 'row-selected'       : '',
         isMigratedR     ? 'row-migrated'       : '',
         isInProc        ? 'row-in-processing'  : '',
+        // Faint tint when the folder filter surfaced this row.
+        row.__folderMatch ? 'row-folder-match' : '',
       ].filter(Boolean).join(' ');
 
       const cbTitle = isMigratedR ? 'Already migrated'
@@ -591,7 +752,12 @@ function renderTable() {
       visibleCols.forEach((col, idx) => {
         const w = state.colWidths[col.f] || col.w;
         const isFirst = idx === 0;
-        const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;background:inherit;' : '';
+        // NOTE: no inline background here — the .col-frozen CSS class provides
+        // an opaque background-color per row-state variant so sticky cells
+        // properly occlude horizontally-scrolled cells behind them. Setting
+        // `background: inherit` inline used to resolve to transparent and
+        // caused the visible "row overlap" when the table was scrolled right.
+        const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;' : '';
         const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
         tbody += `<td class="${frozen}" style="${frozenStyle}width:${w}px;min-width:${w}px;max-width:${w}px;overflow:hidden;">${renderCell(row, col)}</td>`;
       });
@@ -745,7 +911,8 @@ function updateToolbar() {
   const hasFilters = Object.values(state.columnFilters).some(Boolean)
                      || state.globalSearch
                      || state.bucketFilter !== 'all'
-                     || state.folderPath.length > 0;
+                     || state.folderPath.length > 0
+                     || isFolderFilterActive();
   $('clear-filters-btn').disabled = !hasFilters;
 }
 
@@ -810,6 +977,19 @@ function renderActiveFilters() {
       return `<span class="af-chip"><span class="af-col">${esc(label)}:</span> ${esc(val)} <button class="af-x" data-field="${field}">✕</button></span>`;
     });
 
+  // Prepend a chip for the global folder filter when active — same visual
+  // language as the column-filter chips, but with a distinct class so the
+  // user recognises it as a cross-cutting filter rather than per-column.
+  if (isFolderFilterActive()) {
+    const modeLabel = { contains: 'contains', starts_with: 'starts with', exact: 'exact' }[state.folderFilter.mode] || 'contains';
+    chips.unshift(
+      `<span class="af-chip af-chip-folder">`
+      + `<span class="af-col">Folder ${esc(modeLabel)}:</span> `
+      + `${esc(state.folderFilter.text)} `
+      + `<button class="af-x" data-af="folder-filter">✕</button></span>`
+    );
+  }
+
   if (!chips.length) {
     bar.innerHTML = '';
     bar.style.display = 'none';
@@ -820,7 +1000,14 @@ function renderActiveFilters() {
 
   bar.querySelectorAll('.af-x').forEach(btn => {
     btn.addEventListener('click', () => {
-      delete state.columnFilters[btn.dataset.field];
+      // Folder-filter chip clears the global folder filter; per-column
+      // chips clear their specific state.columnFilters entry.
+      if (btn.dataset.af === 'folder-filter') {
+        state.folderFilter = { text: '', mode: 'contains' };
+        _syncFolderFilterButton();
+      } else if (btn.dataset.field) {
+        delete state.columnFilters[btn.dataset.field];
+      }
       applyFiltersAndSort();
       renderAll();
     });
@@ -830,9 +1017,28 @@ function renderActiveFilters() {
     state.globalSearch = '';
     $('search-input').value = '';
     state.bucketFilter = 'all';
+    // Also drop the global folder filter so "Clear All" behaves as advertised.
+    state.folderFilter = { text: '', mode: 'contains' };
+    _syncFolderFilterButton();
     applyFiltersAndSort();
     renderAll();
   });
+}
+
+/** Toggle .has-selection on the Folder Filter toolbar button and update
+ *  its label to include the filter value (e.g. "Folder Filter: Services"). */
+function _syncFolderFilterButton() {
+  const btn = document.getElementById('folder-filter-btn');
+  const lbl = document.getElementById('folder-filter-btn-label');
+  if (!btn || !lbl) return;
+  if (isFolderFilterActive()) {
+    btn.classList.add('has-selection');
+    const modeLabel = { contains: 'contains', starts_with: 'starts', exact: 'exact' }[state.folderFilter.mode] || '';
+    lbl.textContent = `Folder ${modeLabel}: ${state.folderFilter.text}`;
+  } else {
+    btn.classList.remove('has-selection');
+    lbl.textContent = 'Folder Filter';
+  }
 }
 
 /* ── Summary buckets ────────────────────────────────────────────────────── */
@@ -1596,15 +1802,44 @@ function openColPanel() {
     return;
   }
 
+  // Bucket columns by their `group` tag so the picker can render section
+  // headings (§17 spec: "General" + "SharePoint Hierarchy").  Untagged
+  // columns fall into the leading "General" bucket in original order.
+  const groups = new Map();
+  groups.set('General', []);
+  for (const c of COL_CFG) {
+    const g = c.group || 'General';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(c);
+  }
+
+  const renderGroup = (title, cols) => {
+    if (!cols.length) return '';
+    const rows = cols.map(c => `
+        <label class="colpanel-row">
+          <input type="checkbox" class="col-toggle" data-field="${c.f}" ${!state.hiddenCols.has(c.f)?'checked':''}>
+          ${esc(c.h)}
+        </label>`).join('');
+    // Each group also gets a compact "Show all / hide all" affordance so
+    // toggling Folder 5..20 en masse doesn't require 16 clicks.
+    return `
+      <div class="colpanel-group">
+        <div class="colpanel-group-head">
+          <span>${esc(title)}</span>
+          <span class="colpanel-group-actions">
+            <button type="button" class="colpanel-group-btn" data-group="${esc(title)}" data-action="show">Show all</button>
+            <button type="button" class="colpanel-group-btn" data-group="${esc(title)}" data-action="hide">Hide all</button>
+          </span>
+        </div>
+        ${rows}
+      </div>`;
+  };
+
   const html = `
     <div class="colpanel-backdrop" id="colpanel-backdrop"></div>
     <div class="colpanel" id="colpanel">
       <div class="colpanel-head">Columns</div>
-      ${COL_CFG.map(c => `
-        <label class="colpanel-row">
-          <input type="checkbox" class="col-toggle" data-field="${c.f}" ${!state.hiddenCols.has(c.f)?'checked':''}>
-          ${esc(c.h)}
-        </label>`).join('')}
+      ${[...groups.entries()].map(([g, cols]) => renderGroup(g, cols)).join('')}
     </div>`;
 
   const mount = document.createElement('div');
@@ -1623,11 +1858,121 @@ function openColPanel() {
     });
   });
 
+  // Group-level bulk toggles — keep group headers responsive.
+  mount.querySelectorAll('.colpanel-group-btn').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      const g = btn.dataset.group;
+      const action = btn.dataset.action;                // 'show' | 'hide'
+      const cols = groups.get(g) || [];
+      for (const c of cols) {
+        if (action === 'show') state.hiddenCols.delete(c.f);
+        else                   state.hiddenCols.add(c.f);
+      }
+      localStorage.setItem('cmr-hidden', JSON.stringify([...state.hiddenCols]));
+      // Reflect the new checked state without tearing down the panel.
+      mount.querySelectorAll('.col-toggle').forEach(cb => {
+        cb.checked = !state.hiddenCols.has(cb.dataset.field);
+      });
+      renderAll();
+    });
+  });
+
   document.getElementById('colpanel-backdrop').addEventListener('click', closeColPanel);
 }
 
 function closeColPanel() {
   document.getElementById('colpanel-mount')?.remove();
+}
+
+/* ── Global folder-filter popover (Philippe requirement) ──────────────────
+ * A compact 3-field form (text + match-mode + Apply/Clear).  Persists into
+ * state.folderFilter, then re-runs applyFiltersAndSort() + renderAll().
+ * Rendered inside #folder-filter-btn-wrap using the same absolute-under-
+ * button positioning pattern as the Columns and Folder-navigator panels. */
+function openFolderFilterPanel() {
+  const wrap = document.getElementById('folder-filter-btn-wrap');
+  if (!wrap) return;
+  if (document.getElementById('folder-filter-panel')) {
+    closeFolderFilterPanel();
+    return;
+  }
+
+  const curText = state.folderFilter.text || '';
+  const curMode = state.folderFilter.mode || 'contains';
+  const modeOpt = (v, l) => `<option value="${v}"${v === curMode ? ' selected' : ''}>${l}</option>`;
+
+  const html = `
+    <div class="colpanel-backdrop" id="folder-filter-backdrop"></div>
+    <div class="folder-filter-panel" id="folder-filter-panel" role="dialog" aria-label="Folder filter">
+      <div class="folder-filter-head">Folder Filter</div>
+      <div class="folder-filter-row">
+        <label for="ff-text">Folder name</label>
+        <input type="text" id="ff-text" class="folder-filter-input"
+               placeholder="e.g. Services, Don't Use"
+               value="${esc(curText)}" autocomplete="off">
+      </div>
+      <div class="folder-filter-row">
+        <label for="ff-mode">Match</label>
+        <select id="ff-mode" class="folder-filter-select">
+          ${modeOpt('contains',    'Contains')}
+          ${modeOpt('starts_with', 'Starts With')}
+          ${modeOpt('exact',       'Exact Match')}
+        </select>
+      </div>
+      <div class="folder-filter-hint">
+        Searches across <b>Folder 1 – Folder 20</b> for every document in the
+        entire inventory. Case-insensitive. Combines with the current bucket,
+        general search and folder navigation.
+      </div>
+      <div class="folder-filter-actions">
+        <button type="button" class="folder-filter-clear" id="ff-clear">Clear</button>
+        <button type="button" class="folder-filter-apply" id="ff-apply">Apply Filter</button>
+      </div>
+    </div>`;
+
+  const mount = document.createElement('div');
+  mount.id = 'folder-filter-mount';
+  mount.style.cssText = 'position:relative;';
+  wrap.appendChild(mount);
+  mount.innerHTML = html;
+
+  const textEl = document.getElementById('ff-text');
+  const modeEl = document.getElementById('ff-mode');
+  const apply = () => {
+    state.folderFilter = {
+      text: (textEl.value || '').trim(),
+      mode: modeEl.value || 'contains',
+    };
+    _syncFolderFilterButton();
+    state.page = 1;                        // §16: reset pagination for filter
+    applyFiltersAndSort();
+    renderAll();
+    closeFolderFilterPanel();
+  };
+  const clearAndClose = () => {
+    state.folderFilter = { text: '', mode: 'contains' };
+    _syncFolderFilterButton();
+    state.page = 1;
+    applyFiltersAndSort();
+    renderAll();
+    closeFolderFilterPanel();
+  };
+
+  document.getElementById('ff-apply').addEventListener('click', apply);
+  document.getElementById('ff-clear').addEventListener('click', clearAndClose);
+  document.getElementById('folder-filter-backdrop').addEventListener('click', closeFolderFilterPanel);
+  textEl.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter')  { ev.preventDefault(); apply(); }
+    if (ev.key === 'Escape') { ev.preventDefault(); closeFolderFilterPanel(); }
+  });
+
+  // Autofocus for a fast keyboard workflow.
+  setTimeout(() => { try { textEl.focus(); textEl.select(); } catch (_) {} }, 0);
+}
+
+function closeFolderFilterPanel() {
+  document.getElementById('folder-filter-mount')?.remove();
 }
 
 /* ── Migration modal ────────────────────────────────────────────────────── */
@@ -1830,11 +2175,35 @@ async function performMigration(ids) {
  * The DB row is retained (audit history) with Excluded='Yes'.
  * ────────────────────────────────────────────────────────────────────────── */
 const exclusionService = {
-  async exclude(ids) {
+  /**
+   * POST selected FileIDs to /api/exclude.
+   *
+   * @param {Iterable<string>} ids                — file IDs to exclude
+   * @param {object}          [audit]             — optional audit metadata
+   * @param {string}          [audit.reason]      — e.g. "Matched folder filter"
+   * @param {string}          [audit.folderText]  — the folder filter text
+   * @param {string}          [audit.folderMode]  — "contains"|"starts_with"|"exact"
+   * @param {Object<string,{level:string,value:string}>} [audit.matches]
+   *          per-file matched folder level/value (fileID -> {level, value}).
+   *
+   * When `audit` is omitted (row-selection Exclude), the payload contains
+   * only `ids` and the server writes NULLs for reason/level/value — full
+   * back-compat with the old behaviour.
+   */
+  async exclude(ids, audit) {
+    const body = { ids: [...ids] };
+    if (audit && audit.reason) {
+      body.reason           = audit.reason;
+      body.folderFilterText = audit.folderText || null;
+      body.folderFilterMode = audit.folderMode || null;
+      if (audit.matches && Object.keys(audit.matches).length) {
+        body.matches = audit.matches;
+      }
+    }
     const res = await fetch('/api/exclude', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ids: [...ids] }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       let msg = `HTTP ${res.status}`;
@@ -1860,6 +2229,37 @@ function openExcludeModal() {
   const n = eligible.length;
   if (n === 0) return;
 
+  // Compute audit payload if the global folder filter is active.  We
+  // capture the level+value that CAUSED each row to be present so the
+  // exclusion_audit table records exactly why each file was excluded
+  // (§10 spec).  Rows without a match (e.g. selected before the filter
+  // was applied) are omitted from the map — server persists NULL for them.
+  let auditPayload = null;
+  let filterNoteHtml = '';
+  if (isFolderFilterActive()) {
+    const matches = {};
+    let distinctCustomers = new Set();
+    for (const id of eligible) {
+      const row = state.allData.find(r => r.fileID === id);
+      if (row && row.__folderMatch) {
+        matches[id] = { level: row.__folderMatch.level, value: row.__folderMatch.value };
+      }
+      if (row && row.customerName) distinctCustomers.add(row.customerName);
+    }
+    auditPayload = {
+      reason:     'Matched folder filter',
+      folderText: state.folderFilter.text,
+      folderMode: state.folderFilter.mode,
+      matches,
+    };
+    const modeLabel = { contains: 'contains', starts_with: 'starts with', exact: 'exact' }[state.folderFilter.mode] || 'contains';
+    filterNoteHtml = `
+      <div class="modal-note" style="background:#eef4ff;border:1px solid #c7d7f5;color:#1e3a8a;">
+        Folder filter active — <b>Folder ${esc(modeLabel)}: “${esc(state.folderFilter.text)}”</b><br>
+        <span style="opacity:.8">${n} file${n !== 1 ? 's' : ''} across ${distinctCustomers.size} customer${distinctCustomers.size !== 1 ? 's' : ''}. The matched folder level for each file will be recorded in the exclusion audit.</span>
+      </div>`;
+  }
+
   const html = `
     <div class="modal-overlay" id="modal-overlay">
       <div class="modal">
@@ -1868,6 +2268,7 @@ function openExcludeModal() {
         </div>
         <div class="modal-body">
           You are about to exclude <strong>${n}</strong> selected file${n !== 1 ? 's' : ''} from the migration review list.
+          ${filterNoteHtml}
           <div class="modal-note">
             These files will be moved to the <b>Excluded</b> list and will no
             longer be considered for migration. They are <b>not</b> deleted —
@@ -1892,11 +2293,11 @@ function openExcludeModal() {
   $('modal-overlay').addEventListener('click', e => { if (e.target === $('modal-overlay')) close(); });
   $('modal-confirm').addEventListener('click', async () => {
     close();
-    await performExclusion(eligible);
+    await performExclusion(eligible, auditPayload);
   });
 }
 
-async function performExclusion(ids) {
+async function performExclusion(ids, audit) {
   const idSet = new Set(ids);
   if (idSet.size === 0) return;
 
@@ -1907,7 +2308,9 @@ async function performExclusion(ids) {
 
   let result;
   try {
-    result = await exclusionService.exclude(idSet);
+    // `audit` is passed through only when the user is bulk-excluding a
+    // folder-filter result — plain row-selection excludes send only ids.
+    result = await exclusionService.exclude(idSet, audit);
   } catch (err) {
     btn.disabled = false;
     btn.textContent = oldTxt;
@@ -2037,7 +2440,10 @@ function renderExcludedTable() {
 
     EXCLUDED_COLS.forEach((col, idx) => {
       const isFirst = idx === 0;
-      const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;background:inherit;' : '';
+      // See note in renderTable() — no inline background; .col-frozen CSS
+      // supplies opaque per-state background-color so sticky cells occlude
+      // scrolled content instead of letting it bleed through.
+      const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;' : '';
       const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
       // Reuse renderCell for consistency — it handles SharePoint links, dates,
       // status badges, etc. For fields not in COL_CFG (excludedDate) fall back
@@ -2478,6 +2884,10 @@ function initReviewEventListeners() {
     state.sortDir = null;
     state.bucketFilter = 'all';
     state.folderPath = [];                 // reset folder scope to All Contracts
+    // Also drop the global folder filter (§15 spec — Clear Filters must
+    // reset the new folder filter along with everything else).
+    state.folderFilter = { text: '', mode: 'contains' };
+    _syncFolderFilterButton();
     applyFiltersAndSort();
     renderAll();
   });
@@ -2492,6 +2902,14 @@ function initReviewEventListeners() {
     e.stopPropagation();
     if (document.getElementById('folder-panel')) closeFolderPanel();
     else openFolderPanel();
+  });
+  // Global folder filter (Philippe requirement) — separate from the folder
+  // navigator above; searches Folder 1..20 across the entire inventory.
+  const folderFilterBtn = $('folder-filter-btn');
+  if (folderFilterBtn) folderFilterBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    if (document.getElementById('folder-filter-panel')) closeFolderFilterPanel();
+    else openFolderFilterPanel();
   });
 
   // Restore + back-to-review buttons (Excluded view)
