@@ -16,7 +16,14 @@ load_dotenv(BASE_DIR / ".env")
 
 class Settings:
     # ── Seed source (used ONLY by scripts/seed_database.py) ──────────────
-    SEED_CSV_PATH: str = str(BASE_DIR / "Contract Inventory.csv")
+    # Overridable via SEED_CSV_PATH env var so ops can point the seeder at
+    # e.g. "Contract Inventory v2.csv" without editing code.  Relative paths
+    # are resolved against BASE_DIR (repo root).
+    SEED_CSV_PATH: str = (
+        os.getenv("SEED_CSV_PATH")
+        if os.getenv("SEED_CSV_PATH") and Path(os.getenv("SEED_CSV_PATH")).is_absolute()
+        else str(BASE_DIR / (os.getenv("SEED_CSV_PATH") or "Contract Inventory.csv"))
+    )
 
     # ── Azure SQL connection (runtime source of truth) ───────────────────
     AZURE_SQL_SERVER:   str = os.getenv("AZURE_SQL_SERVER", "")

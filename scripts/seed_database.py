@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import settings  # noqa: E402
 from core.database import ensure_schema, get_connection  # noqa: E402
+from services.data_service import backfill_folder_columns  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,6 +183,15 @@ def seed(reset: bool = False) -> None:
 
         cur.execute(f"SELECT COUNT(*) FROM dbo.[{table}]")
         db_count = cur.fetchone()[0]
+
+    # Folder1..Folder20 are derived from SharePointPath by a Python-side
+    # splitter (services.data_service.folder_columns_from_path) — the CSV
+    # does NOT carry these columns.  The MERGE above therefore leaves them
+    # NULL for every freshly-inserted row, which shows up as blank Folder
+    # filters in the UI.  Backfill them here so the seeded state matches
+    # what the app produces on first startup.
+    logger.info("Backfilling folder columns from SharePointPath…")
+    backfill_folder_columns()
 
     logger.info("─" * 60)
     logger.info("Seed complete.")
