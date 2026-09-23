@@ -21,6 +21,10 @@ const COL_CFG = [
   // columns the sync poller keeps fresh (migrationStatus + retryCount +
   // destinationUrl + errorMessage + migrationRequestId).
   { f: 'migrationStatus',        h: 'Migration Status',    ft: 'text', w: 200 },
+  // Who clicked Migrate for this row.  Global (not session-filtered) so
+  // every user can see who initiated each in-flight migration.  Null for
+  // rows that have never been submitted.
+  { f: 'submittedBy',            h: 'Submitted By',        ft: 'text', w: 220 },
   { f: 'fileID',                 h: 'File ID',             ft: 'text', w: 80  },
   // hidden by default
   { f: 'opportunityID',          h: 'Opportunity ID',      ft: 'text', w: 120, hide: true },
@@ -138,6 +142,11 @@ const state = {
   // the modal falls back to a neutral "(destination not configured)"
   // string instead of the old hardcoded "Wave2 destination/…".
   migrationConfig:    { destSiteUrl: '', destLibrary: '', destFolderPath: '' },
+
+  // Auto-refresh cadence (ms).  Default 5 s matches product spec;
+  // overridden by the server-provided pollIntervalSeconds on the first
+  // /api/contracts hydrate.  Clamped 2..60 s at hydrate time.
+  pollIntervalMs:     5_000,
 
   /* ── Folder navigator ──────────────────────────────────────────────────
    * Derived at load-time from row.sharePointPath and rebuilt whenever
@@ -547,7 +556,21 @@ function applyFiltersAndSort() {
     });
   }
   state.filteredData = d;
-  state.page = 1;
+  // Pagination preservation for auto-refresh:
+  //   Poll ticks call applyFiltersAndSort() every ~5 s.  Snapping the
+  //   page back to 1 every tick would yank the user out of whatever
+  //   page they are reading — user-visible flicker AND selection loss.
+  //
+  //   Instead we CLAMP: keep the current page if it still exists in
+  //   the newly-filtered set, else fall back to the last valid page
+  //   (never below 1).  User-driven filter/search/sort/bucket changes
+  //   explicitly reset state.page = 1 at their own call sites, so
+  //   those UX paths are unaffected — the "page always resets on
+  //   filter change" contract is preserved for user actions.
+  const perPage = state.pageSize || 100;
+  const lastPage = Math.max(1, Math.ceil(state.filteredData.length / perPage));
+  if (!Number.isFinite(state.page) || state.page < 1) state.page = 1;
+  if (state.page > lastPage) state.page = lastPage;
 }
 
 /* ── DOM references ─────────────────────────────────────────────────────── */
@@ -2497,41 +2520,103 @@ async function performMigration(ids) {
 }
 
 /* ── Migration status poller ───────────────────────────────────────────────
- * When any row is In Processing, poll /api/migrations/sync every 15s so
- * the UI reflects the platform's authoritative state without the user
- * having to reload.  The poller:
- *   * self-throttles (idempotent — repeated .start() calls are no-ops),
- *   * hides itself when in_processing hits 0,
- *   * refetches /api/contracts opportunistically when the sync reports
- *     any row-level updates so the actual row.migrationStatus values,
- *     destination URLs, retry counts etc. reflect the latest DB state,
- *   * survives a browser refresh via start-on-load in enterReviewScreen(),
- *   * bails out and stops on repeated errors (max 5 in a row) so a broken
- *     platform doesn't spam the network forever.
+ * ALWAYS-ON auto-refresh (default 5 s, overridable via
+ * MIGRATION_POLL_INTERVAL_SECONDS on the server → state.pollIntervalMs
+ * on the client).  Every tick:
+ *
+ *   1. GET  /api/migrations/sync     — cheap; asks the server to reconcile
+ *                                      any in-flight rows with the platform
+ *                                      and returns fresh global +
+ *                                      per-user bucket counts.
+ *   2. GET  /api/contracts           — full row set (Azure SQL indexed
+ *                                      read of ~641 rows) so the table's
+ *                                      status column, destination URL,
+ *                                      retry count, error message and
+ *                                      the new SubmittedBy column all
+ *                                      reflect the DB.  Preserves the
+ *                                      user's selection, filters, page
+ *                                      number, sort, and scroll position.
+ *
+ * Guarantees (mapped to the auto-refresh spec):
+ *
+ *   • Single timer:      `if (timer) return` idempotency in start(); every
+ *                        code path calls start() liberally without risk of
+ *                        creating a second setInterval.
+ *   • No overlap:        `inFlight` guard skips a tick if the previous
+ *                        one hasn't completed (slow network safety).
+ *   • Multi-user:        Runs even when the local user has NOTHING in
+ *                        flight, so another user's submission appears
+ *                        within one interval.  Only stops on logout.
+ *   • Visibility-aware:  pauses on document.visibilityState === 'hidden'
+ *                        and fires an immediate tick when the tab
+ *                        becomes visible again.
+ *   • Error-tolerant:    keeps the last successful state on transient
+ *                        failure; NEVER clears the table.  After
+ *                        MAX_CONSECUTIVE_ERRORS misses (default 12 →
+ *                        ~1 minute at 5 s) shows a single subtle toast
+ *                        (not a popup every tick) and keeps trying.
+ *   • State-preserving:  never touches state.bucketFilter, state.page,
+ *                        state.globalSearch, state.folderFilter,
+ *                        state.folderPath, state.sortCol/Dir, or
+ *                        state.hiddenCols.  Scroll offsets snapshotted
+ *                        before re-render and restored after.
  * ────────────────────────────────────────────────────────────────────────── */
 const migrationPoller = (function () {
-  // 8s — inside the 5–10s band the product team specified.  Faster than
-  // the previous 15s so live "Remaining N/M" counts feel responsive
-  // without hammering the platform or Azure SQL.  Adjustable at the
-  // module level; the browser never reads a server-provided interval.
-  const INTERVAL_MS = 8_000;
-  const MAX_CONSECUTIVE_ERRORS = 5;
-  // Timer handle — non-null means a poll cycle is scheduled.  The
-  // start() guard `if (timer) return` prevents two concurrent timers
-  // even if start() is called from multiple code paths (Migrate click,
-  // enterReviewScreen resume, page-refresh recovery).
-  let timer = null;
-  let inFlight = false;
+  // Sane upper bound on consecutive errors before we surface a toast.
+  // At the default 5 s cadence this is ~1 minute of continuous failure.
+  const MAX_CONSECUTIVE_ERRORS = 12;
+
+  let timer   = null;    // setInterval handle; non-null iff running
+  let inFlight = false;  // true while a tick's fetches are in flight
   let consecutiveErrors = 0;
+  let hasWarnedThisFailureBurst = false;
+  let visibilityHandlerAttached  = false;
+
+  /** Snapshot scroll offsets of the table container + main window so we
+   *  can restore them after re-rendering the DOM.  Also snapshots the
+   *  header <thead> scroll (for future sticky-column implementations). */
+  function _snapshotScroll() {
+    const container = document.querySelector('.table-container');
+    return {
+      containerLeft: container ? container.scrollLeft : 0,
+      containerTop:  container ? container.scrollTop  : 0,
+      windowY:       window.scrollY || 0,
+    };
+  }
+
+  function _restoreScroll(snap) {
+    if (!snap) return;
+    const container = document.querySelector('.table-container');
+    if (container) {
+      container.scrollLeft = snap.containerLeft;
+      container.scrollTop  = snap.containerTop;
+    }
+    if (typeof snap.windowY === 'number') {
+      window.scrollTo({ top: snap.windowY, behavior: 'instant' in window ? 'instant' : 'auto' });
+    }
+  }
 
   async function tick() {
-    if (inFlight) return;               // avoid overlap on slow networks
+    // Overlap guard — spec requirement.  A slow /api/contracts or
+    // /api/migrations/sync must never cause two concurrent refresh
+    // pipelines to run.
+    if (inFlight) return;
+
+    // Skip while the tab is hidden to save CPU + network for background
+    // pages.  visibilitychange handler forces an immediate tick when
+    // the tab regains focus (see start()).
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
     inFlight = true;
+    const scrollSnap = _snapshotScroll();
     try {
+      // ── 1. Sync (asks server to reconcile with platform) ────────────
+      // Also returns fresh count buckets — cheap payload, we always
+      // update state.populationCounts from it.
       const res = await migrationService.sync();
       consecutiveErrors = 0;
+      hasWarnedThisFailureBurst = false;
 
-      // Update the KPI-bar counts immediately (cheap, no refetch needed).
       if (res.counts && typeof res.counts === 'object') {
         state.populationCounts = {
           ...state.populationCounts,
@@ -2542,73 +2627,76 @@ const migrationPoller = (function () {
           in_processing: Number(res.counts.in_processing) || 0,
           migrated:      Number(res.counts.migrated)      || 0,
           failed:        Number(res.counts.failed)        || 0,
-          // Per-user workload-lock fields — server includes these
-          // whenever the session is authenticated.  When they arrive we
-          // trust them absolutely: this is the mechanism that
-          // auto-unlocks the Migrate button as the user's rows complete
-          // (my_in_processing goes 50 → 42 → 30 → … → 0 → can_migrate
-          // flips true → next renderAll enables the button).
+          // Per-user workload-lock fields — trust the server.  This is
+          // what auto-unlocks the Migrate button as the current user's
+          // rows complete (my_in_processing → 0 → can_migrate = true).
           my_in_processing: Number(res.counts.my_in_processing) || 0,
           my_active_total:  Number(res.counts.my_active_total)  || 0,
           can_migrate:      (res.counts.can_migrate !== false),
         };
       }
 
-      // Always refresh the actual row data on every tick — the user
-      // asked for live per-file decrement (one file completes → tile
-      // drops from 10 to 9 to 8 …).  Refreshing only on transitions
-      // meant the table could lag the tiles by one tick when the
-      // server's counts already showed the drop.  /api/contracts is
-      // cheap (single indexed read of ~641 rows) and the poller only
-      // runs while in_processing > 0, so this is bounded work.
-      const anyUpdated = res.updated && (
-        (res.updated.migrated || 0) +
-        (res.updated.failed || 0) +
-        (res.updated.skipped || 0) +
-        (res.updated.in_processing || 0)
-      ) > 0;
-      if (anyUpdated) {
-        // Row-level changes happened — pull fresh rows so Status column,
-        // destination URL, retry count, error message all reflect DB.
-        await refreshContractRows();
-      } else {
-        // Nothing changed row-wise but counts (and now Failed bucket)
-        // may still have — re-render tiles from state.populationCounts
-        // which the block above just refreshed from the sync response.
-        renderAll();
-      }
+      // ── 2. Row refresh ─────────────────────────────────────────────
+      // Always pull fresh rows so the current table reflects DB state
+      // no matter which bucket the user is viewing (In Processing,
+      // Migrated, Yet-to-be-Migrated, etc.).  refreshContractRows()
+      // merges by fileID and calls applyFiltersAndSort() + renderAll()
+      // — both of which respect the current filter/page/sort state
+      // after the pagination-clamp fix in applyFiltersAndSort().
+      await refreshContractRows();
 
-      // Update the live progress badge (top-right) so the user sees
-      // cohort-level progress even between full-table refreshes.  Runs
-      // AFTER refreshContractRows() so state.allData holds the freshest
-      // per-row migrationStatus.
+      // Restore scroll offsets after the DOM re-render so the user
+      // doesn't get bumped back to the top on every tick.
+      _restoreScroll(scrollSnap);
+
+      // Update the live progress badge (top-right).  Runs AFTER
+      // refreshContractRows() so it reads the freshest per-row status.
       migProgress.tick();
-
-      // Stop when nothing is in flight anymore.
-      if ((state.populationCounts.in_processing || 0) === 0) {
-        stop();
-      }
     } catch (err) {
+      // Keep last-good state on the screen; do NOT clear anything.
       consecutiveErrors += 1;
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        showToast('Migration status updates paused — the platform is not reachable. Reload the page to retry.');
-        stop();
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS && !hasWarnedThisFailureBurst) {
+        // One toast per failure burst — not one per tick (spec: "Do not
+        // show repeated error popups every 5 seconds").
+        hasWarnedThisFailureBurst = true;
+        try { showToast('Auto-refresh temporarily unavailable — retrying in background.'); } catch (_) {}
       }
+      // Restore scroll even on error so a partial DOM operation doesn't
+      // strand the user.
+      _restoreScroll(scrollSnap);
+      // Log for diagnostics; never throw.
+      try { console.warn('[migrationPoller] tick failed:', err && err.message || err); } catch (_) {}
     } finally {
       inFlight = false;
     }
   }
 
+  function _attachVisibilityHandler() {
+    if (visibilityHandlerAttached || typeof document === 'undefined') return;
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && timer) {
+        // Immediate catch-up on tab focus; the interval keeps ticking.
+        tick();
+      }
+    });
+    visibilityHandlerAttached = true;
+  }
+
   function start() {
-    if (timer) return;                  // idempotent
-    // Fire once immediately so the user sees updates without waiting.
+    if (timer) return;                  // idempotent — single-timer guarantee
+    _attachVisibilityHandler();
+    // Fire once immediately so the user sees fresh data without waiting.
     tick();
-    timer = setInterval(tick, INTERVAL_MS);
+    const intervalMs = (state && Number.isFinite(state.pollIntervalMs) && state.pollIntervalMs >= 2000)
+                        ? state.pollIntervalMs
+                        : 5000;
+    timer = setInterval(tick, intervalMs);
   }
 
   function stop() {
     if (timer) { clearInterval(timer); timer = null; }
     consecutiveErrors = 0;
+    hasWarnedThisFailureBurst = false;
   }
 
   function isRunning() { return timer != null; }
@@ -2616,10 +2704,25 @@ const migrationPoller = (function () {
   return { start, stop, isRunning, _tick: tick };
 })();
 
-/** Re-fetch /api/contracts and merge into state.allData.  Used by the
- *  poller when the sync reports row-level updates so the UI reflects the
- *  DB (destination URL, retry count, error message, etc.) without the
- *  user having to reload the page. */
+/** Re-fetch /api/contracts and rebuild state.allData from the server
+ *  response.  Called from the auto-refresh poller on every tick.
+ *
+ *  Behaviour:
+ *   - Overlap guard is the poller's responsibility (this function is
+ *     only invoked with `inFlight` already set).
+ *   - Rows are keyed by fileID; any client-side ephemeral flags on the
+ *     PREVIOUS row (currently only `__folderMatch`) are preserved
+ *     through the merge.  Rows the server no longer returns (e.g.
+ *     newly excluded) DROP OUT of state.allData — matches the spec
+ *     "files should disappear from In Processing when they complete /
+ *     from Yet-to-Be-Migrated when another user submits them".
+ *   - Selection (state.selectedIds) is pruned to only IDs still in the
+ *     fresh set, so a row that just got excluded (or migrated) by
+ *     another user can no longer appear "selected" here.
+ *   - Filters/pagination/sort/search state is NOT touched.  Pagination
+ *     is clamped inside applyFiltersAndSort() so a page that shrinks
+ *     falls back to the new last page (never below 1) instead of
+ *     showing an empty page. */
 async function refreshContractRows() {
   const res = await fetch('/api/contracts',
                           { cache: 'no-store', credentials: 'same-origin' });
@@ -2627,27 +2730,41 @@ async function refreshContractRows() {
   if (!res.ok) return;
   const json = await res.json();
   const rows = Array.isArray(json.data) ? json.data : [];
-  // Merge by fileID so we don't lose any client-side ephemeral flags.
-  const byId = new Map(state.allData.map(r => [r.fileID, r]));
-  rows.forEach(r => {
+  // Keep any client-side ephemeral annotations (currently just
+  // __folderMatch) from the previous row snapshot so the folder-filter
+  // chip stays accurate between renders.
+  const prevById = new Map(state.allData.map(r => [r.fileID, r]));
+  state.allData = rows.map(r => {
+    const prev   = prevById.get(r.fileID);
     const merged = {
-      ...byId.get(r.fileID),
+      ...(prev || {}),
       ...r,
       migrate:         (r.migrate === 'Yes' || r.migrate === true) ? 'Yes' : 'No',
       migratedDate:    r.migratedDate || '',
       migrationStatus: r.migrationStatus
                        || (r.migrate === 'Yes' ? STATUS.MIGRATED : STATUS.PENDING),
     };
-    byId.set(r.fileID, normaliseDatesInRow(merged));
+    if (prev && prev.__folderMatch) merged.__folderMatch = prev.__folderMatch;
+    return normaliseDatesInRow(merged);
   });
-  state.allData = [...byId.values()];
+
+  // Prune selection to IDs still present — a row excluded / migrated
+  // by another user in the last few seconds must not linger as
+  // "selected" in the local session.
+  if (state.selectedIds && state.selectedIds.size) {
+    const freshIds = new Set(state.allData.map(r => r.fileID));
+    for (const id of Array.from(state.selectedIds)) {
+      if (!freshIds.has(id)) state.selectedIds.delete(id);
+    }
+  }
+
   if (json.counts) {
     state.populationCounts = {
       ...state.populationCounts,
       ...json.counts,
     };
   }
-  applyFiltersAndSort();
+  applyFiltersAndSort();  // preserves state.page via clamp; no reset.
   renderAll();
 }
 
@@ -3276,12 +3393,13 @@ function enterReviewScreen() {
   $('table-root').closest('.table-container').style.display = '';
   renderAll();
 
-  // Resume polling if we landed on a page where files are already In
-  // Processing (browser refresh mid-migration, or another user submitted
-  // some rows earlier).  Poller is idempotent so double-calling is safe.
-  if ((state.populationCounts.in_processing || 0) > 0) {
-    migrationPoller.start();
-  }
+  // Always-on auto-refresh: kick off the poller unconditionally as
+  // soon as the review screen appears.  The poller is idempotent
+  // (single-timer guard) so calling start() from other paths (e.g.
+  // performMigration after a submit) is a safe no-op.  Runs regardless
+  // of whether the CURRENT user has anything In Processing — other
+  // users' submissions must appear here within one interval too.
+  migrationPoller.start();
 }
 
 function initSourceScreen() {
@@ -3321,6 +3439,14 @@ function initSourceScreen() {
           destLibrary:    String(json.config.destLibrary    || ''),
           destFolderPath: String(json.config.destFolderPath || ''),
         };
+        // Auto-refresh cadence: read once at hydrate, clamp 2..60 s to
+        // avoid a runaway loop from a misconfigured env value.  The
+        // poller reads this on start() so an env change takes effect
+        // on the next full page load without a code change.
+        const raw = Number(json.config.pollIntervalSeconds);
+        if (Number.isFinite(raw) && raw > 0) {
+          state.pollIntervalMs = Math.min(60_000, Math.max(2_000, Math.round(raw * 1000)));
+        }
       }
 
       // Capture server-authoritative population counts so the Manual Review

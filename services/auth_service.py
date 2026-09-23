@@ -82,9 +82,22 @@ def validate_email_domain(email: str) -> Tuple[bool, str]:
         return False, "Please use your @{d} company email address.".format(
             d=settings.APP_COMPANY_DOMAIN
         )
-    # Normalize: keep local-part as typed (case may matter for display),
-    # lower-case the domain half so DB rows are consistent.
-    return True, f"{local}@{domain.lower()}"
+    # Normalize: FULLY lower-case the address (both local-part AND
+    # domain).  Rationale:
+    #   • SubmittedBy is compared with LOWER(...) on the DB side
+    #     (services.data_service._normalise_email + count_all query)
+    #     so a mixed-case session email would work coincidentally today
+    #     but is one refactor away from a bug.
+    #   • Two logins for the same person with different casing
+    #     ("Naveen@x" vs "naveen@x") must resolve to ONE identity for
+    #     the per-user migration lock, otherwise a user could bypass
+    #     their own lock by re-logging in with different casing.
+    #   • RFC 5321 §2.4 states the local-part *may* be case-sensitive
+    #     but in practice virtually every mail server (Exchange, GMail,
+    #     Postfix default) treats it case-insensitively; enterprise
+    #     directories certainly do.  Normalising avoids the class of
+    #     "two identities for one person" bugs entirely.
+    return True, f"{local}@{domain}".lower()
 
 
 # ── Session lifecycle ──────────────────────────────────────────────────────

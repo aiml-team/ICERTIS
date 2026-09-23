@@ -187,8 +187,21 @@ def _migrate_legacy_excluded_table_back() -> None:
 
             # Step 1 — INSERT rows that are ONLY in the legacy table into
             # the master with Excluded='Yes' and the preserved metadata.
-            # We build the column list explicitly (same order both sides).
-            copy_cols_sql = ", ".join(f"[{c}]" for c in _COLUMNS)
+            # Build the column list from the INTERSECTION of both tables'
+            # actual columns — the master schema evolves independently
+            # (SubmittedBy is one such newer addition) and the legacy
+            # excluded table is frozen, so any master-only column must be
+            # skipped in the copy or the INSERT SELECT fails with
+            # "Invalid column name".  Master-only columns simply keep
+            # their default (NULL) on the newly inserted rows.
+            cur.execute(
+                "SELECT name FROM sys.columns "
+                "WHERE object_id = OBJECT_ID(?)",
+                [f"dbo.[{ex}]"],
+            )
+            legacy_cols = {str(r[0]) for r in cur.fetchall()}
+            shared_cols = [c for c in _COLUMNS if c in legacy_cols]
+            copy_cols_sql = ", ".join(f"[{c}]" for c in shared_cols)
             cur.execute(
                 f"INSERT INTO dbo.[{active}] "
                 f"    ({copy_cols_sql}, [Excluded], [ExcludedDate], [ExcludedBy]) "
@@ -255,6 +268,12 @@ MIGRATION_INTEGRATION_COLUMNS = [
     "MigrationRequestId", "MigrationFileItemId", "MigrationSubmittedAt",
     "MigrationBackendStatus", "MigrationRetryCount", "MigrationErrorCode",
     "DestinationUrl", "MigrationLastSyncedAt",
+    # SubmittedBy is populated by mark_in_processing() with the session
+    # email of the user who clicked Migrate.  Exposed to the UI so any
+    # user viewing the global In Processing bucket can see who initiated
+    # each migration ("Submitted By" column).  Does NOT change any
+    # filtering: rows are visible to every session regardless of value.
+    "SubmittedBy",
 ]
 
 _COLUMNS = _BASE_COLUMNS + FOLDER_COLUMNS + MIGRATION_INTEGRATION_COLUMNS
@@ -489,6 +508,11 @@ def _row_to_dict(row) -> dict:
     out["migrationErrorCode"]     = _s(r.get("MigrationErrorCode"))
     out["destinationUrl"]         = _s(r.get("DestinationUrl"))
     out["migrationLastSyncedAt"]  = _fmt_dt(r.get("MigrationLastSyncedAt"))
+    # Audit-only field: who clicked Migrate for this row.  Exposed on
+    # every row so the UI can render a "Submitted By" column globally
+    # (rows remain visible to every logged-in user; this is display, not
+    # filter).  Null for rows that have never been submitted.
+    out["submittedBy"]            = _s(r.get("SubmittedBy"))
     return out
 
 

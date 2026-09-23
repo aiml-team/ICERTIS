@@ -51,7 +51,12 @@ class Settings:
     # MIGRATION_NAME_PREFIX    prepended to auto-generated migration names
     MIGRATION_API_BASE_URL:  str = os.getenv("MIGRATION_API_BASE_URL", "").rstrip("/")
     MIGRATION_API_TIMEOUT:   int = int(os.getenv("MIGRATION_API_TIMEOUT", "30"))
-    MIGRATION_POLL_INTERVAL: int = int(os.getenv("MIGRATION_POLL_INTERVAL_SECONDS", "15"))
+    # Browser polling interval for /api/migrations/sync + /api/contracts.
+    # Product spec: 5 seconds by default so multi-user changes appear
+    # within one interval on every open page.  Overridable per-env via
+    # MIGRATION_POLL_INTERVAL_SECONDS (integer; clamped 2..60 client-side
+    # to keep the loop bounded even under a misconfiguration).
+    MIGRATION_POLL_INTERVAL: int = int(os.getenv("MIGRATION_POLL_INTERVAL_SECONDS", "5"))
     MIGRATION_DEFAULT_PRIORITY: int = int(os.getenv("MIGRATION_DEFAULT_PRIORITY", "3"))
     MIGRATION_NAME_PREFIX:   str = os.getenv("MIGRATION_NAME_PREFIX", "Wave2")
 

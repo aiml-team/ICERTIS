@@ -198,6 +198,11 @@ def get_contracts(include_excluded: bool = False,
                 "destSiteUrl":    _settings.MIGRATION_DEST_SITE_URL or "",
                 "destLibrary":    _settings.MIGRATION_DEST_LIBRARY or "",
                 "destFolderPath": _settings.MIGRATION_DEST_FOLDER_PATH or "",
+                # Browser auto-refresh cadence for buckets + table rows.
+                # Read once on page hydrate; the client clamps to
+                # 2..60 seconds so a misconfigured env value can never
+                # produce a runaway loop or a stalled UI.
+                "pollIntervalSeconds": int(_settings.MIGRATION_POLL_INTERVAL or 5),
             },
         }
     except Exception as exc:
