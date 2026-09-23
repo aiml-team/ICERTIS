@@ -2937,6 +2937,17 @@ const migrationPoller = (function () {
 
   let timer   = null;    // setInterval handle; non-null iff running
   let inFlight = false;  // true while a tick's fetches are in flight
+  // Promise handle for the currently-running tick.  When a caller
+  // (auto-interval OR manual Refresh click) arrives while another
+  // tick is already in flight, we hand back THIS promise instead of
+  // dropping the call silently.  That way `await tick()` from
+  // migrationPoller.refreshNow() actually waits for the real refresh
+  // to finish — otherwise the Refresh button's disabled/"Refreshing…"
+  // state flashes on/off in <100 ms and the user thinks the click
+  // was ignored (visible bug: first click of the button appears
+  // dead, only subsequent clicks that happen to land BETWEEN two
+  // auto-ticks actually work).
+  let inFlightPromise = null;
   let consecutiveErrors = 0;
   let hasWarnedThisFailureBurst = false;
   let visibilityHandlerAttached  = false;
@@ -2965,19 +2976,27 @@ const migrationPoller = (function () {
     }
   }
 
-  async function tick() {
+  function tick() {
     // Overlap guard — spec requirement.  A slow /api/contracts or
     // /api/migrations/sync must never cause two concurrent refresh
-    // pipelines to run.
-    if (inFlight) return;
+    // pipelines to run.  If a tick is already running we return the
+    // SAME promise the first caller is waiting on, so a manual
+    // Refresh click that lands mid-auto-tick awaits the real work
+    // rather than resolving instantly with `undefined` (which used
+    // to make the button appear unresponsive on the first click).
+    if (inFlight && inFlightPromise) return inFlightPromise;
 
     // Skip while the tab is hidden to save CPU + network for background
     // pages.  visibilitychange handler forces an immediate tick when
-    // the tab regains focus (see start()).
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    // the tab regains focus (see start()).  Return a resolved promise
+    // (not undefined) so `await tick()` callers still get a thenable.
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return Promise.resolve();
+    }
 
     inFlight = true;
     const scrollSnap = _snapshotScroll();
+    inFlightPromise = (async () => {
     try {
       // ── 1. Sync (asks server to reconcile with platform) ────────────
       // Also returns fresh count buckets — cheap payload, we always
@@ -3037,7 +3056,12 @@ const migrationPoller = (function () {
       try { console.warn('[migrationPoller] tick failed:', err && err.message || err); } catch (_) {}
     } finally {
       inFlight = false;
+      // Clear the shared promise handle so the NEXT caller starts a
+      // fresh tick instead of awaiting an already-settled one.
+      inFlightPromise = null;
     }
+    })();
+    return inFlightPromise;
   }
 
   function _attachVisibilityHandler() {
@@ -3076,8 +3100,11 @@ const migrationPoller = (function () {
    *  refresh has finished (button re-enable, spinner off, etc.).
    *
    *  Reuses `tick()` verbatim so:
-   *    - the same inFlight overlap guard applies (a manual click while
-   *      an auto-tick is in flight is a no-op, not a duplicate refresh);
+   *    - the same inFlight overlap guard applies — a manual click that
+   *      lands mid-auto-tick now AWAITS the currently-running tick's
+   *      promise (returned by tick()) instead of resolving to
+   *      undefined.  That fixes the "first click looks unresponsive"
+   *      bug where the button flashed disabled→enabled in <100 ms;
    *    - the same scroll snapshot/restore runs;
    *    - the same error-burst suppression logic applies;
    *    - all filters/page/sort/columns are preserved (tick() delegates
