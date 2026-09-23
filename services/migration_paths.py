@@ -252,3 +252,93 @@ def _slug(s: str, max_len: int) -> str:
     out = re.sub(r"[\s/\\]+", "-", s.strip())
     out = re.sub(r"-{2,}", "-", out).strip("-")
     return out[:max_len]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical match key — used by the external-migration reconciliation pass
+# ─────────────────────────────────────────────────────────────────────────────
+# The reconciler needs to match a PostgreSQL file_items row (which carries
+# migration_requests.source_site_url, source_library, and file_items.source_path)
+# against an Azure SQL ContractInventory row (which stores only SharePointPath).
+#
+# Both sides must reduce to the SAME string so a dict lookup is O(1) and no
+# per-row substring compare is needed.  The key is a 3-tuple:
+#
+#     (site_url_lower, library_lower, source_path_lower_slash_normalised)
+#
+# All three components are:
+#   • URL-decoded once (%20 → space, %2C → comma, …)
+#   • stripped of leading/trailing slashes
+#   • collapsed on repeated slashes
+#   • lower-cased  (SharePoint site names and library names are treated
+#                   case-insensitively by SharePoint itself; file paths on
+#                   NTFS/SharePoint are also case-insensitive in practice)
+#
+# The original SharePointPath in Azure SQL is NEVER modified — normalization
+# runs only when building lookup keys.  file_name is preserved verbatim (from
+# the platform) and used ONLY as an additional validation check per §Matching
+# strategy — never as the primary key.
+
+_MULTI_SLASH_RE = re.compile(r"/{2,}")
+
+
+def _norm_component(s: str | None) -> str:
+    """Normalise a single URL/path component for match-key comparison.
+
+    Steps: unquote → strip whitespace → strip leading/trailing slashes →
+    collapse repeated internal slashes → lowercase.  Empty/None → "".
+    """
+    if not s:
+        return ""
+    v = _decode(str(s)).strip()
+    v = v.strip("/")
+    v = _MULTI_SLASH_RE.sub("/", v)
+    return v.lower()
+
+
+def match_key_from_parts(
+    site_url: str | None,
+    library: str | None,
+    source_path: str | None,
+) -> tuple[str, str, str] | None:
+    """Build the canonical 3-tuple match key from already-decoded parts.
+
+    Returns None when any of the three components is empty AFTER
+    normalisation — the caller must treat that as "no reliable key" and
+    fall through to logging the row as unmatched rather than risking a
+    false positive.
+
+    Used on the PostgreSQL side:
+        parts come straight from migration_requests + file_items.
+    Also used on the Azure SQL side after parse_sharepoint_url() has
+    split the stored URL into (site_url, library, source_path).
+    """
+    site = _norm_component(site_url)
+    lib  = _norm_component(library)
+    src  = _norm_component(source_path)
+    if not site or not lib or not src:
+        return None
+    return (site, lib, src)
+
+
+def match_key_from_sharepoint_url(url: str | None) -> tuple[str, str, str] | None:
+    """Build the canonical match key directly from a stored SharePointPath.
+
+    Returns None when the URL is not a parseable SharePoint URL — matches
+    parse_sharepoint_url()'s own None-on-error contract.
+
+    Example (matches the earlier VAS Aero reproduction):
+        input :
+          "https://itellicloud.sharepoint.com/sites/US-Contracts_Management/
+           Chasity%20Icertis%20Project%20Contract%20folder/0-Wave%202/…/
+           2023%20maintenance%20increase%20notice.pdf"
+        output:
+          ("https://itellicloud.sharepoint.com/sites/us-contracts_management",
+           "chasity icertis project contract folder",
+           "0-wave 2/sample for ai testing/vas aero services, llc/software/
+            sap/erp/sla, maint, etc/2023 maintenance increase notice.pdf")
+    """
+    parsed = parse_sharepoint_url(url or "")
+    if parsed is None:
+        return None
+    return match_key_from_parts(parsed.site_url, parsed.library, parsed.source_path)

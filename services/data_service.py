@@ -48,10 +48,12 @@ from core.database import (
     ensure_folder_columns,
     ensure_migration_integration_columns,
     ensure_migration_status_column,
+    ensure_retry_history_table,
     ensure_submitted_by_column,
     exclusion_audit_table_name,
     excluded_table_name,
     get_connection,
+    retry_history_table_name,
 )
 
 # Canonical MigrationStatus values.  Kept as constants so callers can never
@@ -59,7 +61,21 @@ from core.database import (
 STATUS_PENDING       = "Pending"
 STATUS_IN_PROCESSING = "In Processing"
 STATUS_MIGRATED      = "Migrated"
-STATUS_FAILED        = "Failed"
+# Terminal-failure state.  Historically stored as "Failed"; the product
+# rename to "Error" (per §Required top buckets) keeps the same semantics
+# but changes the on-disk enum value.  STATUS_FAILED is kept as a legacy
+# alias so any test/import that still references the old name resolves to
+# the new value — every WRITE now emits "Error", so within one deploy the
+# on-disk data converges.  Reads treat both spellings as equivalent via
+# _ERROR_MIGRATION_STATUSES below.
+STATUS_ERROR         = "Error"
+STATUS_FAILED        = STATUS_ERROR  # legacy alias; do not use in new code
+
+# All spellings that mean "terminal failure".  Every WHERE that wants to
+# include failed rows should reference this tuple; every WRITE always
+# emits STATUS_ERROR so on-disk data converges to the new spelling as
+# rows are touched.
+_ERROR_MIGRATION_STATUSES = ("Error", "Failed")
 
 # Statuses that count as "actively occupying" the platform queue for the
 # per-user workload lock.  Rows in any of these statuses block their
@@ -133,6 +149,7 @@ def _ensure_schema_once() -> None:
         ensure_migration_integration_columns()
         ensure_submitted_by_column()               # per-user workload lock
         ensure_exclusion_audit_table()
+        ensure_retry_history_table()               # retry audit trail
         _migrate_legacy_excluded_table_back()      # one-shot back-migration
         backfill_folder_columns()
         _schema_ready = True
@@ -683,16 +700,31 @@ def count_all(user_email: str | None = None) -> dict:
             my_in_processing = int((r[0] if r else 0) or 0)
             my_active_total  = int((r[1] if r else 0) or 0)
 
+    # Terminal-failure bucket count.  Historically MigrationStatus stored
+    # "Failed" only; the rename to "Error" (§Required top buckets) means
+    # both spellings may co-exist during rollout.  Sum both so the count
+    # is stable regardless of which spelling any given row carries.
+    error_count = sum(by_status.get(s, 0) for s in _ERROR_MIGRATION_STATUSES)
+
     out = {
         "active":        int(a),
         "excluded":      int(e),
         # Total = complete inventory (active + excluded).  Manager spec:
-        # "Total Documents must include Excluded".
+        # "Total Documents must include Excluded".  Error rows are already
+        # inside `active` (they carry MigrationStatus='Error' with
+        # Excluded='No'), so the identity
+        #   total = pending + in_processing + migrated + error + excluded
+        # holds without any additional term.
         "total":         int(a) + int(e),
         "pending":       by_status.get(STATUS_PENDING, 0),
         "in_processing": by_status.get(STATUS_IN_PROCESSING, 0),
         "migrated":      by_status.get(STATUS_MIGRATED, 0),
-        "failed":        by_status.get(STATUS_FAILED, 0),
+        # NEW canonical bucket for the "Error" tile.
+        "error":         error_count,
+        # Legacy alias kept for backward compat with any older client build
+        # that still reads `pc.failed` (e.g. cached static/js/app.js).  The
+        # server-side value is identical; new code should read `error`.
+        "failed":        error_count,
     }
     if submitter:
         out["my_in_processing"] = my_in_processing
@@ -835,13 +867,16 @@ def mark_in_processing(file_ids: Iterable[str],
             # value in place via COALESCE (relevant when a legacy call
             # site retries a Failed row that was previously stamped by
             # its original submitter — we keep the original owner).
+            # Accept both 'Error' (canonical, post-rename) and 'Failed'
+            # (legacy on-disk value) so /api/migrations/retry works
+            # against rows that were written before the rename deploy.
             cur.execute(
                 f"UPDATE dbo.[{table}] "
                 f"SET   [MigrationStatus] = ?, "
                 f"      [SubmittedBy]     = COALESCE(?, [SubmittedBy]) "
                 f"WHERE [FileID] IN ({placeholders}) "
                 f"  AND ISNULL([MigrationStatus], '{STATUS_PENDING}') IN "
-                f"       ('{STATUS_PENDING}', '{STATUS_FAILED}') "
+                f"       ('{STATUS_PENDING}', '{STATUS_ERROR}', 'Failed') "
                 f"  AND ISNULL([Migrate], 'No') <> 'Yes' "
                 f"  AND ISNULL([Excluded], 'No') <> 'Yes'",
                 [STATUS_IN_PROCESSING,
@@ -892,7 +927,8 @@ def apply_migration_result(
         MigratedDate    = <ts>
 
     For each FAILED FileID:
-        MigrationStatus = 'Failed'
+        MigrationStatus = 'Error'    (canonical spelling post-rename;
+                                      legacy 'Failed' still accepted on read)
         Migrate         = 'No'       (unchanged; FAILED != MIGRATED)
         MigratedDate    = <untouched>
 
@@ -967,6 +1003,62 @@ def apply_migration_result(
         "failed":     failed_written,
         "migratedAt": _fmt_dt(ts),
     }
+
+
+def classify_retry_eligibility(file_ids: Iterable[str]) -> dict:
+    """Given a set of requested FileIDs, split them into three lists based
+    on the current MigrationStatus on the master inventory.
+
+    Used by /api/migrations/retry BEFORE calling record_retry_history or
+    mark_in_processing so the endpoint can reject the entire request with
+    400 if the caller included any FileID that is not currently in Error.
+
+    Returns:
+        {
+          "eligible":    [FileID, ...],   # MigrationStatus IN ('Error','Failed')
+          "ineligible":  [{"fileID": "...", "status": "..."}, ...],
+                                          # in an unretriable status (Pending /
+                                          # In Processing / Migrated) — the
+                                          # request should be rejected 400
+          "unknown":     [FileID, ...],   # no row exists (or row is Excluded)
+        }
+
+    Excluded rows are treated as `unknown` — you can't retry a row that
+    isn't in the active inventory.  The three lists are disjoint and
+    together cover every input id (deduped, whitespace-trimmed).
+    """
+    _ensure_schema_once()
+    ids = sorted({str(i).strip() for i in file_ids if str(i).strip()})
+    if not ids:
+        return {"eligible": [], "ineligible": [], "unknown": []}
+
+    table = settings.CONTRACT_TABLE
+    ph = ", ".join("?" for _ in ids)
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT [FileID], ISNULL([MigrationStatus], '{STATUS_PENDING}') "
+            f"FROM   dbo.[{table}] "
+            f"WHERE  [FileID] IN ({ph}) "
+            f"  AND  ISNULL([Excluded], 'No') <> 'Yes'",
+            ids,
+        )
+        found: dict[str, str] = {}
+        for r in cur.fetchall():
+            found[str(r[0])] = str(r[1])
+
+    eligible:   list[str] = []
+    ineligible: list[dict] = []
+    unknown:    list[str] = []
+    for fid in ids:
+        st = found.get(fid)
+        if st is None:
+            unknown.append(fid)
+        elif st in _ERROR_MIGRATION_STATUSES:
+            eligible.append(fid)
+        else:
+            ineligible.append({"fileID": fid, "status": st})
+    return {"eligible": eligible, "ineligible": ineligible, "unknown": unknown}
 
 
 def get_rows_for_submission(file_ids: Iterable[str]) -> List[dict]:
@@ -1092,6 +1184,155 @@ def record_submission(
     return {"rowsAffected": len(ids), "submittedAt": _fmt_dt(now)}
 
 
+def record_retry_history(
+    file_ids: Iterable[str],
+    *,
+    retried_by: str,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Snapshot the failure evidence for a set of rows about to be retried.
+
+    Called from the /api/migrations/retry route BEFORE mark_in_processing
+    flips the rows out of Error — the flip overwrites the existing
+    ErrorMessage / MigrationRequestId / MigrationFileItemId columns and
+    increments MigrationRetryCount, so we must capture the "previous"
+    values first for the audit trail.
+
+    One row is inserted into ContractMigrationRetryHistory per FileID.
+    ``new_migration_request_id`` is written later by
+    ``stamp_retry_history_new_request_id`` once the platform accepts the
+    resubmission and returns the fresh migration UUID.
+
+    Rows whose FileID is not currently in Error/Failed are skipped
+    (defensive; the caller already validated eligibility server-side).
+
+    Parameters
+    ----------
+    file_ids
+        Local ContractInventory FileIDs the user requested to retry.
+    retried_by
+        Session email of the user who clicked Retry.  Required — nothing
+        writes to this table without an owner.
+    session_id
+        Optional session id for finer-grained audit correlation.
+
+    Returns a list of dicts, one per snapshot row, each shaped:
+        {
+          "fileID":                      "337,514",
+          "previousMigrationRequestId":  "<uuid>" | "",
+          "previousRetryCount":          0,
+          "retryHistoryId":              123    # BIGINT PK of the new row
+        }
+    """
+    _ensure_schema_once()
+    email = _normalise_email(retried_by)
+    if not email:
+        raise ValueError("record_retry_history requires retried_by")
+    ids = [str(i).strip() for i in file_ids if str(i).strip()]
+    if not ids:
+        return []
+
+    table   = settings.CONTRACT_TABLE
+    hist    = retry_history_table_name()
+    placeholders = ", ".join("?" for _ in ids)
+
+    out: list[dict] = []
+    with get_connection() as cn:
+        cn.autocommit = False
+        cur = cn.cursor()
+        try:
+            # Snapshot in one round-trip — pull the exact columns we
+            # need to persist.  Accept both 'Error' and 'Failed' so the
+            # audit works during the rollout window before every row
+            # has been rewritten to the new spelling.
+            cur.execute(
+                f"SELECT [FileID], [FileName], [MigrationRequestId], "
+                f"       [MigrationFileItemId], [ErrorMessage], "
+                f"       ISNULL([MigrationRetryCount], 0) "
+                f"FROM   dbo.[{table}] "
+                f"WHERE  [FileID] IN ({placeholders}) "
+                f"  AND  [MigrationStatus] IN ('{STATUS_ERROR}', 'Failed')",
+                ids,
+            )
+            snapshots = cur.fetchall()
+
+            for r in snapshots:
+                fid       = str(r[0]) if r[0] is not None else ""
+                fname     = str(r[1]) if r[1] is not None else None
+                prev_mid  = str(r[2]) if r[2] is not None else None
+                prev_fiid = str(r[3]) if r[3] is not None else None
+                prev_err  = str(r[4]) if r[4] is not None else None
+                prev_rc   = int(r[5] or 0)
+                cur.execute(
+                    f"INSERT INTO dbo.[{hist}] "
+                    f"  (file_id, file_name, "
+                    f"   previous_migration_request_id, "
+                    f"   previous_migration_file_item_id, "
+                    f"   previous_error_message, "
+                    f"   previous_retry_count, "
+                    f"   retried_by, session_id) "
+                    f"OUTPUT INSERTED.id "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [fid, fname, prev_mid, prev_fiid, prev_err,
+                     prev_rc, email, session_id],
+                )
+                new_id = int(cur.fetchone()[0])
+                out.append({
+                    "fileID":                     fid,
+                    "previousMigrationRequestId": prev_mid or "",
+                    "previousRetryCount":         prev_rc,
+                    "retryHistoryId":             new_id,
+                })
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
+
+    logger.info(
+        "record_retry_history: retried_by=%s snapshots=%d requested=%d",
+        email, len(out), len(ids),
+    )
+    return out
+
+
+def stamp_retry_history_new_request_id(
+    retry_history_ids: Iterable[int],
+    *,
+    new_migration_request_id: str,
+) -> int:
+    """Fill in ``new_migration_request_id`` on retry-history rows.
+
+    Called from /api/migrations/retry AFTER the platform's create+add
+    calls succeed and record_submission has stamped the new
+    MigrationRequestId onto the master inventory rows.  Closes the
+    audit loop: "row was retried by X at T; here's the previous batch
+    that failed; here's the new batch we submitted".
+
+    A retry-history row without a new_migration_request_id represents a
+    retry attempt whose platform submission itself failed — the master
+    inventory row will already have been rolled back to Error by the
+    normal /api/migrate error-handling path.
+    """
+    hist_ids = [int(i) for i in retry_history_ids if i]
+    if not hist_ids:
+        return 0
+    hist = retry_history_table_name()
+    placeholders = ", ".join("?" for _ in hist_ids)
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"UPDATE dbo.[{hist}] "
+            f"SET   new_migration_request_id = ? "
+            f"WHERE id IN ({placeholders}) "
+            f"  AND new_migration_request_id IS NULL",
+            [new_migration_request_id, *hist_ids],
+        )
+        cn.commit()
+        return int(cur.rowcount or 0)
+
+
 def apply_backend_file_status(
     updates: list[dict],
 ) -> dict:
@@ -1161,17 +1402,21 @@ def apply_backend_file_status(
                         f"    [DestinationUrl]          = COALESCE(?, [DestinationUrl]), "
                         f"    [MigrationLastSyncedAt]   = ? "
                         f"WHERE [FileID] = ? "
-                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+            f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_ERROR}', 'Failed')",
                         [now, backend_status, file_item_id, retry_count,
                          destination_url, now, fid],
                     )
                     if cur.rowcount:
                         migrated += cur.rowcount
 
-                elif ui == STATUS_FAILED:
+                elif ui == STATUS_ERROR:
+                    # Terminal failure — write "Error" (the new spelling).
+                    # WHERE accepts both spellings so a mid-rollout row
+                    # already at 'Failed' can transition idempotently to
+                    # 'Error' with fresh observation columns.
                     cur.execute(
                         f"UPDATE dbo.[{table}] "
-                        f"SET [MigrationStatus]         = '{STATUS_FAILED}', "
+                        f"SET [MigrationStatus]         = '{STATUS_ERROR}', "
                         f"    [MigrationBackendStatus]  = ?, "
                         f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
                         f"    [MigrationRetryCount]     = ?, "
@@ -1179,7 +1424,7 @@ def apply_backend_file_status(
                         f"    [ErrorMessage]            = ?, "
                         f"    [MigrationLastSyncedAt]   = ? "
                         f"WHERE [FileID] = ? "
-                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', 'Error', 'Failed')",
                         [backend_status, file_item_id, retry_count,
                          error_code, error_message, now, fid],
                     )
@@ -1189,18 +1434,18 @@ def apply_backend_file_status(
                 elif ui == "Skipped":
                     # Backend 'skipped' — treat as a distinct terminal state
                     # (NOT the same as business Excluded per §13).  We fold
-                    # into Failed for the bucket count so the UI identity
-                    # A = B+C+D+E still holds; ErrorMessage explains why.
+                    # into Error for the bucket count so the UI identity
+                    # A = B+C+D+E+Error still holds; ErrorMessage explains why.
                     cur.execute(
                         f"UPDATE dbo.[{table}] "
-                        f"SET [MigrationStatus]         = '{STATUS_FAILED}', "
+                        f"SET [MigrationStatus]         = '{STATUS_ERROR}', "
                         f"    [MigrationBackendStatus]  = ?, "
                         f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
                         f"    [MigrationErrorCode]      = COALESCE(?, 'skipped'), "
                         f"    [ErrorMessage]            = ?, "
                         f"    [MigrationLastSyncedAt]   = ? "
                         f"WHERE [FileID] = ? "
-                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', 'Error', 'Failed')",
                         [backend_status, file_item_id, error_code,
                          error_message or "Skipped by migration backend",
                          now, fid],
@@ -1218,7 +1463,7 @@ def apply_backend_file_status(
                         f"    [ErrorMessage]            = ?, "
                         f"    [MigrationLastSyncedAt]   = ? "
                         f"WHERE [FileID] = ? "
-                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', '{STATUS_FAILED}')",
+                        f"  AND [MigrationStatus] IN ('{STATUS_IN_PROCESSING}', 'Error', 'Failed')",
                         [backend_status, file_item_id, retry_count,
                          error_code, error_message, now, fid],
                     )
@@ -1237,6 +1482,266 @@ def apply_backend_file_status(
         "apply_backend_file_status: migrated=%d failed=%d skipped=%d in_processing=%d total=%d",
         migrated, failed, skipped, ip, total,
     )
+    return {
+        "migrated":      migrated,
+        "failed":        failed,
+        "skipped":       skipped,
+        "in_processing": ip,
+        "rowsAffected":  total,
+    }
+
+
+def build_match_key_index() -> dict:
+    """Build a snapshot ``{match_key -> [FileID, …]}`` from ContractInventory.
+
+    Used by the reconciliation pass to resolve a PostgreSQL file_items
+    row (which carries site/library/source_path) to a local FileID.
+
+    Notes
+    -----
+    * Only rows with a non-empty SharePointPath are indexed — a row
+      without a SharePoint URL cannot possibly be a candidate.
+    * Rows already ``Excluded='Yes'`` are still indexed: exclusion is a
+      business decision and the reconciler must never resurrect them,
+      but excluding them from the index would break the ambiguity check
+      (two rows sharing a key, one excluded, would look unambiguous
+      when they aren't).  The writer's own WHERE clause protects the
+      excluded row from being modified — see reconcile_external_file_status().
+    * Value is a LIST — a canonical key may legitimately map to multiple
+      inventory rows if the same physical file appears in the inventory
+      more than once.  The reconciler treats len>1 as ambiguous and
+      declines to update rather than guessing.
+    """
+    _ensure_schema_once()
+    # Local import to avoid pulling migration_paths at module import time
+    # (keeps the data_service <-> migration_paths edge one-directional).
+    from services.migration_paths import match_key_from_sharepoint_url
+
+    table = settings.CONTRACT_TABLE
+    index: dict[tuple[str, str, str], list[str]] = {}
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT [FileID], [SharePointPath] FROM dbo.[{table}] "
+            f"WHERE [SharePointPath] IS NOT NULL AND LEN([SharePointPath]) > 0"
+        )
+        for fid, sp in cur.fetchall():
+            key = match_key_from_sharepoint_url(sp)
+            if key is None:
+                continue
+            index.setdefault(key, []).append(str(fid))
+    return index
+
+
+def reconcile_external_file_status(
+    updates: list[dict],
+) -> dict:
+    """Reflect externally-triggered migration outcomes into ContractInventory.
+
+    Sibling of :func:`apply_backend_file_status`.  Same status semantics
+    (map completed→Migrated, failed→Failed, skipped→Failed with skipped
+    tag, active→In Processing) BUT the ``WHERE`` guard is relaxed to
+    allow the ``Pending → target`` transition — the whole point of this
+    helper is to reconcile files that were migrated by another tool and
+    therefore never went through our /api/migrate endpoint (they were
+    never marked In Processing here).
+
+    Idempotency & no-downgrade rules (spec §Do not overwrite valid newer
+    states):
+
+      * ``Migrated`` rows are NEVER touched — a completed row does not
+        get demoted back to In Processing because of an older PostgreSQL
+        row that arrived out of order.
+      * ``Excluded='Yes'`` rows are NEVER touched — exclusion is a
+        business decision independent of migration state.
+      * Repeated reconciliation is safe: rows that already match the
+        target state are updated with fresh MigrationLastSyncedAt only
+        (via cur.rowcount == 0 → we don't bump the "changed" counters).
+
+    Every ``update`` dict:
+        {
+          "fileID":              "337,514",              required
+          "uiStatus":            "Migrated" | "In Processing" | "Failed" | "Skipped",
+          "backendStatus":       "completed" | ...,     required
+          "migrationRequestId":  "<uuid>" | None,
+          "migrationFileItemId": "<uuid>" | None,
+          "submittedBy":         str | None,      # from migration_requests.created_by
+          "migratedDate":        datetime | None, # from file_items.completed_at
+          "destinationUrl":      str | None,      # from audit_logs metadata
+          "retryCount":          int | None,
+          "errorMessage":        str | None,
+          "errorCode":           str | None,
+        }
+
+    Returns::
+        {"migrated": int, "failed": int, "skipped": int,
+         "in_processing": int, "rowsAffected": int}
+
+    where each count is rows that ACTUALLY transitioned (rowcount>0 with
+    a state change).  Rows that were already at the target state are not
+    counted — that keeps the sync response's ``reconciled`` bucket
+    meaningful ("new externally-discovered updates this tick").
+    """
+    _ensure_schema_once()
+    if not updates:
+        return {"migrated": 0, "failed": 0, "skipped": 0,
+                "in_processing": 0, "rowsAffected": 0}
+
+    now = datetime.utcnow()
+    table = settings.CONTRACT_TABLE
+    migrated = failed = skipped = ip = 0
+
+    # A single reconciliation tick may target hundreds of rows; do them
+    # all inside ONE transaction (one commit at the end) so partial
+    # updates never leak.  Matches the apply_backend_file_status pattern.
+    with get_connection() as cn:
+        cn.autocommit = False
+        cur = cn.cursor()
+        try:
+            for u in updates:
+                fid = str(u.get("fileID") or "").strip()
+                ui  = (u.get("uiStatus") or "").strip()
+                if not fid or ui not in (
+                    STATUS_IN_PROCESSING, STATUS_MIGRATED, STATUS_FAILED, "Skipped",
+                ):
+                    continue
+
+                backend_status  = u.get("backendStatus")
+                mig_req_id      = u.get("migrationRequestId")
+                file_item_id    = u.get("migrationFileItemId")
+                submitted_by    = _normalise_email(u.get("submittedBy") or "") or None
+                migrated_date   = u.get("migratedDate")
+                destination_url = u.get("destinationUrl")
+                retry_count     = u.get("retryCount")
+                error_message   = u.get("errorMessage")
+                error_code      = u.get("errorCode")
+
+                # Common guard for ALL branches: never touch Migrated
+                # (no downgrade) and never touch Excluded='Yes' rows
+                # (business decision, orthogonal to migration state).
+                # The state whitelist explicitly INCLUDES 'Pending'
+                # because external discovery is designed to promote
+                # Pending rows into their real state.  Both 'Error' (new)
+                # and 'Failed' (legacy) are accepted so the transition
+                # completes even on mid-rollout rows.
+                allowed_from = (
+                    f"[MigrationStatus] IN "
+                    f"  ('Pending','{STATUS_IN_PROCESSING}','Error','Failed') "
+                    f"AND ISNULL([Excluded],'No') <> 'Yes'"
+                )
+
+                if ui == STATUS_MIGRATED:
+                    # Terminal success — set every terminal-state column.
+                    # MigratedDate prefers the platform's completed_at
+                    # (spec §Status mapping: MigratedDate = completed_at)
+                    # and falls back to "now" when it's NULL.
+                    mig_dt = migrated_date or now
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_MIGRATED}', "
+                        f"    [Migrate]                 = 'Yes', "
+                        f"    [Migrated]                = 'True', "
+                        f"    [MigratedDate]            = ?, "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationRequestId]      = COALESCE(?, [MigrationRequestId]), "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = NULL, "
+                        f"    [ErrorMessage]            = NULL, "
+                        f"    [DestinationUrl]          = COALESCE(?, [DestinationUrl]), "
+                        f"    [SubmittedBy]             = COALESCE(?, [SubmittedBy]), "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? AND {allowed_from} "
+                        f"  AND [MigrationStatus] <> '{STATUS_MIGRATED}'",
+                        [mig_dt, backend_status, mig_req_id, file_item_id,
+                         retry_count, destination_url, submitted_by, now, fid],
+                    )
+                    if cur.rowcount:
+                        migrated += cur.rowcount
+
+                elif ui == STATUS_ERROR:
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_ERROR}', "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationRequestId]      = COALESCE(?, [MigrationRequestId]), "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = ?, "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [SubmittedBy]             = COALESCE(?, [SubmittedBy]), "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? AND {allowed_from} "
+                        f"  AND ([MigrationStatus] NOT IN ('{STATUS_ERROR}','Failed') "
+                        f"       OR ISNULL([MigrationBackendStatus],'') <> ISNULL(?,''))",
+                        [backend_status, mig_req_id, file_item_id, retry_count,
+                         error_code, error_message, submitted_by, now, fid,
+                         backend_status],
+                    )
+                    if cur.rowcount:
+                        failed += cur.rowcount
+
+                elif ui == "Skipped":
+                    # Same fold-into-Error policy as apply_backend_file_status.
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_ERROR}', "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationRequestId]      = COALESCE(?, [MigrationRequestId]), "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationErrorCode]      = COALESCE(?, 'skipped'), "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [SubmittedBy]             = COALESCE(?, [SubmittedBy]), "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? AND {allowed_from} "
+                        f"  AND ([MigrationStatus] NOT IN ('{STATUS_ERROR}','Failed') "
+                        f"       OR ISNULL([MigrationBackendStatus],'') <> ISNULL(?,''))",
+                        [backend_status, mig_req_id, file_item_id, error_code,
+                         error_message or "Skipped by migration backend",
+                         submitted_by, now, fid, backend_status],
+                    )
+                    if cur.rowcount:
+                        skipped += cur.rowcount
+
+                else:  # STATUS_IN_PROCESSING — active platform state
+                    # Promote Pending → In Processing on first observation.
+                    # For a row already In Processing this refreshes the
+                    # observation columns; the state-change guard below
+                    # keeps the counter honest by not counting a pure
+                    # observation refresh as "reconciled".
+                    cur.execute(
+                        f"UPDATE dbo.[{table}] "
+                        f"SET [MigrationStatus]         = '{STATUS_IN_PROCESSING}', "
+                        f"    [MigrationBackendStatus]  = ?, "
+                        f"    [MigrationRequestId]      = COALESCE(?, [MigrationRequestId]), "
+                        f"    [MigrationFileItemId]     = COALESCE(?, [MigrationFileItemId]), "
+                        f"    [MigrationRetryCount]     = ?, "
+                        f"    [MigrationErrorCode]      = ?, "
+                        f"    [ErrorMessage]            = ?, "
+                        f"    [SubmittedBy]             = COALESCE(?, [SubmittedBy]), "
+                        f"    [MigrationLastSyncedAt]   = ? "
+                        f"WHERE [FileID] = ? AND {allowed_from} "
+                        f"  AND [MigrationStatus] <> '{STATUS_IN_PROCESSING}'",
+                        [backend_status, mig_req_id, file_item_id, retry_count,
+                         error_code, error_message, submitted_by, now, fid],
+                    )
+                    if cur.rowcount:
+                        ip += cur.rowcount
+
+            cn.commit()
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
+
+    total = migrated + failed + skipped + ip
+    if total:
+        logger.info(
+            "reconcile_external_file_status: migrated=%d failed=%d "
+            "skipped=%d in_processing=%d total=%d",
+            migrated, failed, skipped, ip, total,
+        )
     return {
         "migrated":      migrated,
         "failed":        failed,

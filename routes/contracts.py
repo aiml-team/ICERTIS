@@ -62,6 +62,7 @@ from services.data_service import (
     apply_backend_file_status,
     apply_migration_result,
     can_user_start_migration,
+    classify_retry_eligibility,
     count_all,
     get_local_ids_for_migration,
     get_rows_for_submission,
@@ -70,8 +71,10 @@ from services.data_service import (
     load_excluded,
     mark_excluded,
     mark_in_processing,
+    record_retry_history,
     record_submission,
     restore_excluded,
+    stamp_retry_history_new_request_id,
 )
 from services.migration_platform import (
     MigrationPlatformError,
@@ -84,6 +87,16 @@ router = APIRouter(tags=["Contracts"])
 class MigrateRequest(BaseModel):
     ids: List[str] = Field(..., min_length=1,
                            description="FileIDs selected for migration")
+
+
+class RetryRequest(BaseModel):
+    """Payload for POST /api/migrations/retry.  Same shape as
+    MigrateRequest — kept as a separate model so its docs read
+    "retry" instead of "migrate" in the OpenAPI schema and so the
+    contract stays explicit if the two flows diverge later."""
+    ids: List[str] = Field(..., min_length=1,
+                           description="FileIDs currently in the Error bucket "
+                                       "that the user wants to resubmit")
 
 
 class FolderMatch(BaseModel):
@@ -141,6 +154,14 @@ class MigrationSyncResponse(BaseModel):
     counts:   Dict[str, Any]     = Field(..., description="Full up-to-date population counts (same shape as /api/contracts); when the session is authenticated also includes my_in_processing / my_active_total / can_migrate")
     errors:   List[Dict[str, str]] = Field(default_factory=list,
                                            description="Per-migration errors — polling continues on the rest")
+    # Externally-triggered migration reconciliation (spec §External
+    # discovery).  Optional so older clients that only inspect the four
+    # legacy fields keep working unchanged.
+    reconciled: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Summary of the external-migration reconciliation pass this tick: "
+                    "polled/candidates/matched/ambiguous/unmatched + updated bucket counts.",
+    )
 
 
 @router.get("/contracts")
@@ -168,7 +189,9 @@ def get_contracts(include_excluded: bool = False,
               "pending":          P,   # active + MigrationStatus='Pending'
               "in_processing":    IP,  # active + MigrationStatus='In Processing'
               "migrated":         Mig, # active + MigrationStatus='Migrated'
-              "failed":           F,   # active + MigrationStatus='Failed'
+              "error":            E,   # active + MigrationStatus IN ('Error','Failed')
+              "failed":           E,   # legacy alias for `error` (kept for
+                                       # cached JS during rollout); identical value
               # Per-user workload-lock fields (present iff session
               # carries an email — the /api/contracts route always
               # requires a session, so these are always present):
@@ -220,7 +243,8 @@ def get_excluded():
 
 
 def _submit_groups_background(groups: List[Dict[str, Any]],
-                              created_by: str) -> None:
+                              created_by: str,
+                              retry_history_by_local_id: Optional[Dict[str, int]] = None) -> None:
     """Phase 3 of the migrate flow, executed AFTER the /api/migrate HTTP
     response has been sent to the client.
 
@@ -233,8 +257,18 @@ def _submit_groups_background(groups: List[Dict[str, Any]],
     used to use inline (apply_migration_result), so nothing gets stuck
     In Processing that was never accepted by the platform (task §9).
 
+    ``retry_history_by_local_id`` (optional, retry flow only): mapping
+    FileID → retry_history.id captured by /api/migrations/retry before
+    the row was flipped out of Error.  When present, after the platform
+    accepts the resubmission and record_submission stamps the new
+    MigrationRequestId onto the master row, we close the audit loop by
+    updating retry_history.new_migration_request_id to the same value.
+    For non-retry submissions (the classic Migrate flow) this parameter
+    is None and the behaviour is unchanged.
+
     This helper is deliberately extracted verbatim from the original
-    inline Phase 3 logic — no behaviour change, only execution timing.
+    inline Phase 3 logic plus the retry-audit hook — no other behaviour
+    change, only execution timing.
     """
     import logging as _lg
     log = _lg.getLogger(__name__)
@@ -316,6 +350,35 @@ def _submit_groups_background(groups: List[Dict[str, Any]],
             migration_request_id=migration_id,
             file_item_id_by_local_id=file_item_id_by_local_id,
         )
+
+        # ── 3d (retry flow only): close the audit loop by writing
+        # `new_migration_request_id` on every retry-history row whose
+        # FileID we just resubmitted successfully.  A retry-history row
+        # left with NULL new_migration_request_id represents a retry
+        # whose platform submission itself failed — the master row was
+        # already rolled back to Error by apply_migration_result above.
+        if retry_history_by_local_id:
+            hist_ids = [
+                retry_history_by_local_id[fid]
+                for fid in group_local_ids
+                if fid in retry_history_by_local_id
+            ]
+            if hist_ids:
+                try:
+                    stamp_retry_history_new_request_id(
+                        hist_ids,
+                        new_migration_request_id=migration_id,
+                    )
+                except Exception as exc:
+                    # Non-fatal — the master row was already stamped by
+                    # record_submission.  Failing to close the audit
+                    # loop shouldn't fail the whole retry.
+                    log.warning(
+                        "background submit: retry-history stamp failed for "
+                        "migration_id=%s hist_ids=%s: %s",
+                        migration_id, hist_ids, exc,
+                    )
+
         log.info(
             "background submit: migration_id=%s files=%d created_by=%s",
             migration_id, len(group_local_ids), created_by,
@@ -554,6 +617,254 @@ def migrate_contracts(payload: MigrateRequest,
         raise HTTPException(status_code=500, detail=f"Migration failed: {exc}")
 
 
+@router.post("/migrations/retry")
+def retry_migrations(payload: RetryRequest,
+                     background_tasks: BackgroundTasks,
+                     session: dict = Depends(require_session)):
+    """Resubmit a set of Error rows to the migration platform.
+
+    Mirrors POST /api/migrate exactly with three additions specific to
+    the retry flow:
+
+      1. Server-side eligibility gate: every requested FileID MUST
+         currently be in MigrationStatus IN ('Error', 'Failed').  Any
+         row in a non-terminal or already-migrated state causes the
+         whole request to be rejected with 400 (partial retries are not
+         allowed — the user needs to know exactly which rows they're
+         acting on).
+
+      2. Per-user workload lock: uses the SAME my_active_total gate
+         that /api/migrate uses.  Only the caller's active count blocks
+         them — other users' activity does not.  The gate is enforced
+         both by an early can_user_start_migration() check and re-checked
+         atomically inside mark_in_processing()'s UPDLOCK+HOLDLOCK
+         transaction so two tabs from the same user can't both submit.
+
+      3. Failure evidence is snapshotted into
+         ContractMigrationRetryHistory before mark_in_processing flips
+         the rows out of Error.  The snapshot captures the previous
+         MigrationRequestId, MigrationFileItemId, ErrorMessage, and
+         MigrationRetryCount so a later audit can reconstruct every
+         attempt for a FileID.  After record_submission stamps the NEW
+         MigrationRequestId onto the master row (in the background
+         task), the same UUID is written back onto the retry-history
+         row so both sides of the audit trail are linked.
+
+    Response shape is identical to /api/migrate — same fields, same
+    semantics — so the browser's existing post-submit rendering path
+    can be reused unchanged.
+    """
+    service = migration_platform.service
+
+    # Fail fast if the platform is not configured (same gate /api/migrate uses).
+    if not service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Migration platform is not configured "
+                "(MIGRATION_API_BASE_URL is empty).  Cannot submit retry."
+            ),
+        )
+
+    from core.config import settings as _settings
+    _dest_missing = []
+    if not (_settings.MIGRATION_DEST_SITE_URL or "").strip():
+        _dest_missing.append("MIGRATION_DEST_SITE_URL")
+    if not (_settings.MIGRATION_DEST_LIBRARY or "").strip():
+        _dest_missing.append("MIGRATION_DEST_LIBRARY")
+    if not (_settings.MIGRATION_DEST_FOLDER_PATH or "").strip():
+        _dest_missing.append("MIGRATION_DEST_FOLDER_PATH")
+    if _dest_missing:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Migration configuration incomplete: "
+                + ", ".join(f"{v} is missing." for v in _dest_missing)
+            ),
+        )
+
+    session_email = (session.get("email") or "").strip()
+    created_by    = session_email or "system"
+    session_id    = session.get("session_id") or session.get("id")
+
+    # ── Eligibility gate — every requested FileID must be Error/Failed. ──
+    # Enforced server-side so a stale client (Migrated row hanging in a
+    # cached selection, JS bug that includes Pending rows, etc.) can
+    # never accidentally retry the wrong document.
+    classification = classify_retry_eligibility(payload.ids)
+    if classification["ineligible"] or classification["unknown"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason":     "INELIGIBLE_FOR_RETRY",
+                "message":    (
+                    "One or more requested FileIDs are not currently in "
+                    "the Error bucket.  Retry only accepts rows whose "
+                    "MigrationStatus is 'Error' (or the legacy 'Failed')."
+                ),
+                "ineligible": classification["ineligible"],
+                "unknown":    classification["unknown"],
+                "eligible":   classification["eligible"],
+            },
+        )
+    if not classification["eligible"]:
+        # Empty payload after dedupe — nothing to do.
+        return {
+            "runId":               None,
+            "migrationRequestIds": [],
+            "inProcessing":        [],
+            "submitted":           {},
+            "failed":              [],
+            "skipped":             [],
+            "invalid":             [],
+            "groups":              [],
+            "retryHistory":        [],
+            "error":               None,
+        }
+
+    # ── Per-user workload lock (fast pre-check).  See /api/migrate for
+    # the full rationale — same lock, same 409 shape. ──────────────────
+    if session_email:
+        allowed, active_count = can_user_start_migration(session_email)
+        if not allowed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "allowed":     False,
+                    "reason":      "ACTIVE_MIGRATION_EXISTS",
+                    "activeCount": active_count,
+                    "message":     (
+                        f"You already have {active_count} file"
+                        f"{'s' if active_count != 1 else ''} in processing. "
+                        f"Wait until your current migration completes "
+                        f"before submitting a retry."
+                    ),
+                },
+            )
+
+    try:
+        # ── Retry §3: snapshot failure evidence BEFORE the flip.  If
+        # this fails we abort — better to lose the retry than lose the
+        # audit trail.  Note: record_retry_history is idempotent per
+        # FileID in the sense that it always writes a NEW row, so
+        # replaying a retry that partially succeeded is safe.
+        eligible_ids = classification["eligible"]
+        try:
+            history_rows = record_retry_history(
+                eligible_ids,
+                retried_by=session_email or "system",
+                session_id=str(session_id) if session_id else None,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Retry audit snapshot failed: {exc}",
+            )
+        retry_history_by_local_id = {
+            r["fileID"]: r["retryHistoryId"] for r in history_rows
+        }
+
+        # ── Phase 1 — flip Error → In Processing under the per-user
+        # lock.  mark_in_processing accepts both 'Error' and legacy
+        # 'Failed' on the source side, so no changes are needed there.
+        try:
+            phase1 = mark_in_processing(eligible_ids, submitted_by=session_email)
+        except ActiveMigrationExistsError as exc:
+            # Race with a concurrent tab.  The retry-history rows we
+            # just wrote will be left with NULL new_migration_request_id
+            # — that's a valid audit signal ("retry attempted but
+            # blocked").  Return the same 409 shape as /api/migrate.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "allowed":     False,
+                    "reason":      "ACTIVE_MIGRATION_EXISTS",
+                    "activeCount": exc.active_count,
+                    "message":     (
+                        f"You already have {exc.active_count} file"
+                        f"{'s' if exc.active_count != 1 else ''} in processing. "
+                        f"Wait until your current migration completes "
+                        f"before submitting a retry."
+                    ),
+                },
+            )
+        in_processing_ids = phase1["succeeded"]
+        skipped_ids       = phase1["skipped"]
+
+        if not in_processing_ids:
+            # Race lost between classify + flip (row was picked up by
+            # another mark_in_processing call in the meantime, or the
+            # Excluded flag was flipped).  Well-formed empty response.
+            return {
+                "runId":               None,
+                "migrationRequestIds": [],
+                "inProcessing":        [],
+                "submitted":           {},
+                "failed":              [],
+                "skipped":             skipped_ids,
+                "invalid":             [],
+                "groups":              [],
+                "retryHistory":        history_rows,
+                "error":               None,
+            }
+
+        # ── Phase 2 — load + group + roll back invalid-path rows.
+        rows = get_rows_for_submission(in_processing_ids)
+        groups, invalid_rows = service.group_files_for_submission(rows)
+
+        invalid_ids = [str(r.get("fileID")) for r in invalid_rows if r.get("fileID")]
+        invalid_items: List[Dict[str, str]] = []
+        if invalid_ids:
+            apply_migration_result(succeeded_ids=[], failed_ids=invalid_ids)
+            invalid_items = [
+                {"fileID": fid,
+                 "error": "SharePointPath is missing or not a recognisable "
+                          "SharePoint URL — cannot build source_path."}
+                for fid in invalid_ids
+            ]
+
+        # ── Schedule Phase 3 in the background, WITH the retry-history
+        # map so record_submission's new MigrationRequestId can be
+        # mirrored back onto the audit rows.
+        still_in_processing: List[str] = []
+        groups_report: List[Dict[str, Any]] = []
+        for g in groups:
+            group_local_ids = [fid for fid, _p in g["files"]]
+            still_in_processing.extend(group_local_ids)
+            groups_report.append({
+                "migrationId":   None,
+                "sourceSite":    g["site_url"],
+                "sourceLibrary": g["library"],
+                "sourceFolder":  g["folder_path"],
+                "fileCount":     len(group_local_ids),
+                "status":        "queued",
+                "error":         None,
+            })
+
+        if groups:
+            background_tasks.add_task(
+                _submit_groups_background, groups, created_by,
+                retry_history_by_local_id,
+            )
+
+        return {
+            "runId":               None,
+            "migrationRequestIds": [],
+            "inProcessing":        still_in_processing,
+            "submitted":           {},
+            "failed":              list(invalid_items),
+            "skipped":             skipped_ids,
+            "invalid":             invalid_items,
+            "groups":              groups_report,
+            "retryHistory":        history_rows,
+            "error":               None,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Retry failed: {exc}")
+
+
 @router.post("/migrations/sync", response_model=MigrationSyncResponse)
 def sync_migrations(session: dict = Depends(require_session)):
     """Sync Azure SQL row statuses from the migration platform.
@@ -717,11 +1028,35 @@ def sync_migrations(session: dict = Depends(require_session)):
             for k in aggregate:
                 aggregate[k] += int(delta.get(k, 0) or 0)
 
+    # ── External-migration reconciliation (spec §External discovery) ──
+    # Runs AFTER the known-migration branch so any race between "user
+    # submitted here" and "external tool touched the same file" is
+    # resolved in favour of the more-recent PostgreSQL row.  Failures
+    # here never break the sync response — the reconciler is fail-soft.
+    reconciled_summary: Optional[Dict[str, Any]] = None
+    try:
+        from services import migration_reconciliation
+        rec = migration_reconciliation.reconcile_external_migrations()
+        # Fold the reconciled bucket counts into the same aggregate the
+        # frontend already renders — a completed external migration is
+        # observationally identical to a completed local one from the
+        # UI's perspective.
+        rec_updated = rec.get("updated") or {}
+        for k in aggregate:
+            aggregate[k] += int(rec_updated.get(k, 0) or 0)
+        reconciled_summary = rec
+    except Exception as exc:  # pragma: no cover — defensive
+        import logging as _lg2
+        _lg2.getLogger(__name__).exception(
+            "reconcile_external_migrations failed: %s", exc,
+        )
+
     return MigrationSyncResponse(
         polled=len(ids),
         updated=aggregate,
         counts=count_all(user_email=_user_email),
         errors=errors,
+        reconciled=reconciled_summary,
     )
 
 

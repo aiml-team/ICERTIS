@@ -95,14 +95,44 @@ html, body {
 .buckets {
   flex-shrink: 0;
   display: grid;
-  /* 5 equal columns per manager KPI spec: A | B | C | D | E
-     A = Total | B = Yet to be Migrated | C = In Processing | D = Migrated | E = Excluded */
+  /* 5 equal columns per manager KPI spec.  Row 1 holds the five primary
+     KPIs (A | B | C | D | E).  Row 2 holds Excluded on the far left
+     (col 1) and the manual Refresh button on the far right (col 5,
+     directly under the Error bucket).  The three middle cells on row 2
+     remain intentionally empty — that empty white space is where the
+     manager wanted the Refresh button to visually "hang" from. */
   grid-template-columns: repeat(5, 1fr);
+  grid-auto-rows: auto;
   align-items: stretch;
   gap: 12px;
   padding: 10px 24px;
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
+}
+
+/* Explicit placement for row 1 (A..E).  Using nth-of-type on the direct
+   <button> children keeps this decoupled from source ordering of the
+   non-button Refresh slot that also lives inside .buckets. */
+.buckets > .bucket-total          { grid-row: 1; grid-column: 1; }
+.buckets > .bucket-pending        { grid-row: 1; grid-column: 2; }
+.buckets > .bucket-in-processing  { grid-row: 1; grid-column: 3; }
+.buckets > .bucket-migrated       { grid-row: 1; grid-column: 4; }
+.buckets > .bucket-error          { grid-row: 1; grid-column: 5; }
+
+/* Row 2: Excluded on the far left, Refresh on the far right (under Error).
+   Middle columns 2–4 stay empty by design. */
+.buckets > .bucket-excluded       { grid-row: 2; grid-column: 1; }
+.buckets > .bucket-refresh-slot   { grid-row: 2; grid-column: 5; }
+
+/* Right-align the Refresh button inside its grid cell so it hugs the
+   right edge of the bucket row (directly under the Error bucket).
+   The wrapper itself has no visual chrome — it exists only to give the
+   grid a placement target without altering the button's styling. */
+.bucket-refresh-slot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .bucket {
@@ -225,6 +255,8 @@ html, body {
 .bucket-pending  .bucket-value { color: #92400e; }
 .bucket-in-processing { border-left-color: #7c3aed; }
 .bucket-in-processing .bucket-value { color: #5b21b6; }
+.bucket-error    { border-left-color: #dc2626; }
+.bucket-error    .bucket-value { color: #b91c1c; }
 .bucket-excluded { border-left-color: #b42318; }
 .bucket-excluded .bucket-value { color: #971b12; }
 .bucket-selected { border-left-color: #0f6cbd; }
@@ -249,6 +281,9 @@ html, body {
 
 .bucket-in-processing.active { background: #f5f3ff; border-color: #c4b5fd; box-shadow: inset 0 0 0 1px #c4b5fd; }
 .bucket-in-processing.active .bucket-label { color: #5b21b6; }
+
+.bucket-error.active { background: #fef2f2; border-color: #fca5a5; box-shadow: inset 0 0 0 1px #fca5a5; }
+.bucket-error.active .bucket-label { color: #b91c1c; }
 
 .bucket-excluded.active { background: #fef2f2; border-color: #fca5a5; box-shadow: inset 0 0 0 1px #fca5a5; }
 .bucket-excluded.active .bucket-label { color: #971b12; }
@@ -281,16 +316,20 @@ html, body {
   margin-right: auto;   /* pushes .tb-right to the far right of the toolbar */
 }
 
-/* Right cluster — export & other row-scoped actions */
+/* Right cluster — export & other row-scoped actions.
+ * Horizontal row: currently holds only Export CSV.  (Refresh lives in
+ * the bucket grid, on row 2 under the Error bucket — see .buckets.) */
 .tb-right {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.tb-export-btn {
+.tb-export-btn,
+.tb-refresh-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
 }
 
@@ -299,6 +338,32 @@ html, body {
   line-height: 1;
   color: #0f6cbd;
 }
+
+.tb-refresh-icon {
+  font-size: 13px;
+  line-height: 1;
+  /* White on the blue primary button below.  Kept as its own rule so
+     changing the button palette in one place also drops the icon in. */
+  color: #fff;
+  display: inline-block;
+  /* Slow spin while a refresh is in flight — the .is-refreshing class
+     is toggled by the button click handler. */
+  transition: transform 0.15s ease;
+}
+
+.tb-refresh-btn.is-refreshing .tb-refresh-icon {
+  animation: tb-refresh-spin 0.9s linear infinite;
+}
+
+@keyframes tb-refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* NOTE: The primary-blue palette for .tb-refresh-btn is defined AFTER
+   the generic .tb-btn / .tb-btn:hover / .tb-btn:disabled rules further
+   down in this file so it wins the cascade — see the "Primary-blue
+   Refresh button" block just after .tb-btn:disabled. */
 
 /* Search input wrapper */
 .tb-search {
@@ -382,6 +447,52 @@ html, body {
 .tb-btn:disabled {
   opacity: 0.38;
   cursor: default;
+}
+
+/* ── Primary-blue Refresh button ────────────────────────────────────────
+ * Placed AFTER .tb-btn / .tb-btn:hover / .tb-btn:disabled so this palette
+ * wins the cascade (equal specificity, later rule).  Uses the same
+ * #0f6cbd family as .action-migrate-btn.active and .source-start-btn so
+ * Refresh reads as a first-class primary action consistent with the
+ * rest of the app.  This intentionally overrides only color / background
+ * / border / shadow — size, height, padding, border-radius, font, and
+ * layout stay inherited from .tb-btn, and the .is-refreshing spin
+ * behavior + click handler are untouched. */
+.tb-refresh-btn {
+  background: #0f6cbd;
+  border-color: #0a57a0;
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(15, 108, 189, 0.28);
+}
+
+/* Selector shape mirrors .tb-btn:hover:not(:disabled) so specificity is
+   equal (0,2,0) and source order lets this rule win. */
+.tb-refresh-btn:hover:not(:disabled) {
+  background: #0d5fa6;
+  border-color: #0a4f90;
+  color: #fff;
+  box-shadow: 0 3px 10px rgba(15, 108, 189, 0.36);
+}
+
+.tb-refresh-btn:active:not(:disabled) {
+  background: #0a5099;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+/* Disabled / in-flight state.  The click handler sets `disabled = true`
+   AND adds `.is-refreshing` for the duration of a refresh — this rule
+   covers both.  Kept visibly blue-tinted (not grey) so users can still
+   see it is the Refresh action, just clearly non-interactive.  We also
+   reset .tb-btn:disabled's opacity: 0.38 so the button stays legible. */
+.tb-refresh-btn:disabled,
+.tb-refresh-btn.is-refreshing {
+  background: #7fb0dc;
+  border-color: #6aa1d1;
+  color: #fff;
+  cursor: not-allowed;
+  box-shadow: none;
+  opacity: 1;
 }
 
 /* ── Bottom action bar ──────────────────────────────────────────────────
@@ -512,6 +623,65 @@ html, body {
   background: #fdf3e2;
   border-color: #e5c07b;
   color: #8a5a00;
+}
+
+/* ── Retry button (recovery / warning) ────────────────────────────────────
+ * Same skeleton as the Migrate button — the two are mutually exclusive at
+ * runtime (Migrate shows in every non-Error bucket, Retry shows only in
+ * the Error bucket).  Amber palette signals "this is a recovery action
+ * from a bad state", visually distinct from Migrate's neutral blue. */
+.action-retry-btn {
+  height: 36px;
+  padding: 0 26px;
+  border: 1px solid #c9cdd3;
+  border-radius: 6px;
+  background: #eaecef;
+  font-size: 13px;
+  font-weight: 600;
+  color: #9ca3af;
+  cursor: not-allowed;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.05s;
+  font-family: inherit;
+  min-width: 140px;
+}
+
+.action-retry-btn.active {
+  background: #d97706;
+  border-color: #b45309;
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(217,119,6,0.28);
+}
+
+.action-retry-btn.active:hover {
+  background: #b45309;
+  border-color: #92400e;
+  box-shadow: 0 3px 10px rgba(217,119,6,0.36);
+}
+
+.action-retry-btn.active:active {
+  background: #92400e;
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+.action-retry-btn:disabled {
+  background: #eaecef;
+  border-color: #c9cdd3;
+  color: #9ca3af;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.action-retry-btn.locked,
+.action-retry-btn.locked:disabled {
+  background: #fdf3e2;
+  border-color: #e5c07b;
+  color: #8a5a00;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 /* ── Exclude button (destructive / danger) ─────────────────────────────── */

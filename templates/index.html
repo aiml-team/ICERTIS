@@ -43,13 +43,17 @@
   <div class="screen screen-review" id="screen-review" style="display:none">
 
     <!-- Summary KPIs.  Order per manager spec:
-           A — Total Documents        (= B + C + D + E)
+           A — Total Documents        (= B + C + D + E + F)
            B — Yet to be Migrated
            C — In Processing
            D — Migrated
-           E — Excluded
+           E — Error       (terminal-failure state; retryable)
+           F — Excluded
          Selected is deliberately NOT in this row — it lives in the bottom
-         action bar next to the Migrate button. -->
+         action bar next to the Migrate button.
+         Note: Error rows stay in Total Documents (they represent real
+         inventory that failed to migrate) but are NOT folded into
+         Yet-to-be-Migrated — the user must go through the Retry flow. -->
     <div class="buckets" id="buckets" role="tablist" aria-label="Migration status KPIs">
       <button type="button" class="bucket bucket-total active" data-bucket="all" role="tab" aria-selected="true" title="Show all active documents (includes excluded on click)">
         <span class="bucket-tag" aria-hidden="true">A</span>
@@ -58,7 +62,7 @@
           <span class="bucket-total-right">
             <span class="bucket-value" id="bucket-total">0</span>
             <span class="bucket-formula" id="bucket-total-formula" tabindex="0"
-                  title="B + C + D + E">B + C + D + E</span>
+                  title="B + C + D + E + F">B + C + D + E + F</span>
           </span>
         </span>
       </button>
@@ -83,13 +87,35 @@
           <span class="bucket-value" id="bucket-migrated">0</span>
         </span>
       </button>
-      <button type="button" class="bucket bucket-excluded" data-bucket="excluded" role="tab" aria-selected="false" title="View recoverable excluded documents">
+      <button type="button" class="bucket bucket-error" data-bucket="error" role="tab" aria-selected="false" title="Documents whose migration failed; select rows and click Retry to resubmit">
         <span class="bucket-tag" aria-hidden="true">E</span>
+        <span class="bucket-body">
+          <span class="bucket-label">Error</span>
+          <span class="bucket-value" id="bucket-error">0</span>
+        </span>
+      </button>
+      <button type="button" class="bucket bucket-excluded" data-bucket="excluded" role="tab" aria-selected="false" title="View recoverable excluded documents">
+        <span class="bucket-tag" aria-hidden="true">F</span>
         <span class="bucket-body">
           <span class="bucket-label">Excluded</span>
           <span class="bucket-value" id="bucket-excluded">0</span>
         </span>
       </button>
+      <!-- Manual Refresh button — placed in the bucket grid (row 2, far
+           right, under the Error bucket) per manager spec.  Purely
+           additive to the existing 5-s auto-refresh cadence: reuses
+           migrationPoller.refreshNow() which runs the same tick() the
+           interval timer runs, so filters/search/page/sort/columns/
+           selection are all preserved.  Disabled while the refresh is
+           in flight.  Sits in a right-aligned slot so it visually
+           hangs under the Error column while Excluded remains on the
+           far left of the same row. -->
+      <div class="bucket-refresh-slot">
+        <button class="tb-btn tb-refresh-btn" id="refresh-btn" type="button" title="Refresh bucket counts and current table data now">
+          <span class="tb-refresh-icon" aria-hidden="true">&#8635;</span>
+          <span class="tb-refresh-label">Refresh</span>
+        </button>
+      </div>
     </div>
 
     <!-- Toolbar -->
@@ -154,6 +180,15 @@
         <button class="action-exclude-btn" id="exclude-btn" type="button" disabled title="Exclude selected files from the migration review list (recoverable)">Exclude</button>
         <span class="action-sel-count" id="sel-count">No files selected</span>
         <button class="action-migrate-btn" id="migrate-btn" disabled>Migrate</button>
+        <!-- Retry button: hidden unless the current view is the Error bucket
+             AND at least one row is selected AND every selected row is
+             currently in the Error bucket AND the user has no active
+             migration workload (my_active_total == 0).  All four gates are
+             also enforced server-side by /api/migrations/retry — the client
+             gates only exist to prevent obvious mistakes. -->
+        <button class="action-retry-btn" id="retry-btn" type="button" disabled
+                style="display:none"
+                title="Retry the migration for the selected Error rows">Retry</button>
         <!-- Per-user workload lock indicator (task 2026-09-24).  Populated
              by updateToolbar() from state.populationCounts.my_in_processing.
              Hidden entirely when the logged-in user has no active rows —

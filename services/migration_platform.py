@@ -80,7 +80,14 @@ _BACKEND_SKIPPED       = frozenset({"skipped"})
 # but declared here as strings to avoid a circular import).
 UI_STATUS_IN_PROCESSING = "In Processing"
 UI_STATUS_MIGRATED      = "Migrated"
-UI_STATUS_FAILED        = "Failed"
+# Terminal-failure bucket.  Renamed from "Failed" to "Error" per the
+# new bucket layout (Total / Yet-to-be-Migrated / In Processing /
+# Migrated / Error / Excluded).  Semantics unchanged: files reach this
+# state ONLY when PostgreSQL reports the terminal enum value 'failed'
+# (or 'cancelled', which the platform treats as a terminal non-success
+# outcome).  A file in 'retrying' remains In Processing.
+UI_STATUS_ERROR         = "Error"
+UI_STATUS_FAILED        = UI_STATUS_ERROR  # legacy alias
 UI_STATUS_SKIPPED       = "Skipped"  # not mapped to Excluded per §13
 
 

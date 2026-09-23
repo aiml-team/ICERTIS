@@ -538,6 +538,85 @@ def ensure_exclusion_audit_table() -> None:
     logger.info("Schema ensured for table dbo.%s", _EXCLUSION_AUDIT_TABLE)
 
 
+# ── Retry-history audit table ──────────────────────────────────────────────
+# One row per row-retry event.  The Error → In-Processing transition on the
+# master inventory OVERWRITES the previous failure evidence
+# (MigrationRequestId, MigrationFileItemId, ErrorMessage), so we snapshot
+# those into this sidecar first.  That preserves the full "what happened
+# on each attempt" audit trail even after the retry succeeds or fails
+# again, and it makes it possible for operators to reconstruct the exact
+# sequence of platform submissions for any given FileID.
+#
+# Columns:
+#   file_id                       — local ContractInventory.FileID
+#   file_name                     — snapshot at retry time (for audit
+#                                   readability without a master JOIN)
+#   previous_migration_request_id — the PA/platform batch this file was
+#                                   in when it failed
+#   previous_migration_file_item_id — the platform file item id (may be
+#                                     NULL if the failure happened before
+#                                     the file made it into the batch)
+#   previous_error_message        — the last ErrorMessage observed on the
+#                                   master row before the retry cleared it
+#   previous_retry_count          — value of MigrationRetryCount BEFORE
+#                                   this retry (0 for first retry, N for
+#                                   the (N+1)th)
+#   retried_by                    — email of the user who clicked Retry
+#   retried_at                    — UTC timestamp of the retry submission
+#   session_id                    — session that submitted the retry
+#   new_migration_request_id      — populated on the second UPDATE, after
+#                                   the platform accepts the resubmission
+#                                   and record_submission stamps the new
+#                                   MigrationRequestId back onto the master
+#                                   row.  NULL until then (or forever if
+#                                   the platform submit failed and the row
+#                                   was rolled back to Error).
+_RETRY_HISTORY_TABLE = "ContractMigrationRetryHistory"
+
+_RETRY_HISTORY_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables WHERE name = '{table}' AND schema_id = SCHEMA_ID('dbo')
+)
+BEGIN
+    CREATE TABLE dbo.[{table}] (
+        id                              BIGINT        IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        file_id                         NVARCHAR(64)  NOT NULL,
+        file_name                       NVARCHAR(512) NULL,
+        previous_migration_request_id   NVARCHAR(128) NULL,
+        previous_migration_file_item_id NVARCHAR(128) NULL,
+        previous_error_message          NVARCHAR(MAX) NULL,
+        previous_retry_count            INT           NOT NULL CONSTRAINT DF_{table}_prevretry DEFAULT (0),
+        retried_by                      NVARCHAR(256) NOT NULL,
+        retried_at                      DATETIME2     NOT NULL CONSTRAINT DF_{table}_at       DEFAULT SYSUTCDATETIME(),
+        session_id                      NVARCHAR(128) NULL,
+        new_migration_request_id        NVARCHAR(128) NULL
+    );
+    CREATE INDEX IX_{table}_file_id     ON dbo.[{table}](file_id);
+    CREATE INDEX IX_{table}_retried_by  ON dbo.[{table}](retried_by);
+    CREATE INDEX IX_{table}_retried_at  ON dbo.[{table}](retried_at DESC);
+END
+"""
+
+
+def retry_history_table_name() -> str:
+    """Fixed name — kept as a helper so callers never hand-concatenate."""
+    return _RETRY_HISTORY_TABLE
+
+
+def ensure_retry_history_table() -> None:
+    """Idempotent create of the ContractMigrationRetryHistory sidecar table.
+
+    Called from services.data_service._ensure_schema_once() on the first
+    DB access this process makes.  Safe to run repeatedly — the DDL is
+    guarded by IF NOT EXISTS.
+    """
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(_RETRY_HISTORY_DDL.format(table=_RETRY_HISTORY_TABLE))
+        cn.commit()
+    logger.info("Schema ensured for table dbo.%s", _RETRY_HISTORY_TABLE)
+
+
 # ── User-session tracking table ────────────────────────────────────────────
 # Lightweight table populated by the email-only login layer.  Its ONLY
 # purpose is to know which company email owns the current session id and to

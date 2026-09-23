@@ -321,6 +321,10 @@ const STATUS = Object.freeze({
   PENDING:       'Pending',
   IN_PROCESSING: 'In Processing',
   MIGRATED:      'Migrated',
+  // Canonical spelling post-rename.  FAILED kept as a legacy alias so
+  // any old response shape (or cached JS with a "Failed" string still
+  // in-flight) continues to route correctly to the Error bucket.
+  ERROR:         'Error',
   FAILED:        'Failed',
 });
 
@@ -334,14 +338,21 @@ function rowStatus(row) {
 
 function isMigrated(row)     { return rowStatus(row) === STATUS.MIGRATED; }
 function isInProcessing(row) { return rowStatus(row) === STATUS.IN_PROCESSING; }
-function isFailed(row)       { return rowStatus(row) === STATUS.FAILED; }
-// "Pending" here means "eligible to be selected/migrated" — i.e. NOT in
-// any of the three terminal/in-flight states.
-function isPending(row)      { const s = rowStatus(row); return s !== STATUS.MIGRATED && s !== STATUS.IN_PROCESSING; }
-// Everything except Migrated + In Processing is selectable (Pending + Failed).
-// Failed rows CAN be retried by the user — spec §10 leaves this open, and
-// keeping them selectable matches the "return to pending or failed" wording.
-function isSelectable(row)   { const s = rowStatus(row); return s !== STATUS.MIGRATED && s !== STATUS.IN_PROCESSING; }
+// Error / Failed are aliases of the same terminal state.  The predicate
+// keeps the historical `isFailed` name so nothing downstream breaks.
+function isFailed(row)       { const s = rowStatus(row); return s === STATUS.ERROR || s === STATUS.FAILED; }
+function isError(row)        { return isFailed(row); }
+// "Pending" here means "eligible to be selected for Migrate" — i.e. NOT
+// in any of the three terminal/in-flight states (and NOT Error, which
+// requires the Retry flow, not Migrate).
+function isPending(row)      { const s = rowStatus(row); return s === STATUS.PENDING; }
+// Selectable for Migrate: Pending only.  Error rows are selectable in
+// the Error bucket for Retry, but that predicate is bucket-scoped and
+// lives in the toolbar/action-bar logic — the row-level check here
+// governs the Migrate flow.
+function isSelectable(row)   { return isPending(row); }
+// Selectable for Retry: any row currently in Error/Failed.
+function isRetrySelectable(row) { return isFailed(row); }
 
 /* ── Folder navigation ────────────────────────────────────────────────────
  * Derive a business-folder hierarchy from row.sharePointPath.  The virtual
@@ -528,8 +539,12 @@ function applyFiltersAndSort() {
   if (state.bucketFilter === 'migrated')            d = d.filter(isMigrated);
   else if (state.bucketFilter === 'in_processing')  d = d.filter(isInProcessing);
   // "Pending" bucket shows only rows eligible for migration selection —
-  // Failed rows are kept out so the user isn't misled about retry status.
+  // Failed/Error rows are kept out so the user isn't misled about retry status.
   else if (state.bucketFilter === 'pending')        d = d.filter(r => rowStatus(r) === STATUS.PENDING);
+  // "Error" bucket surfaces terminal-failure rows (both spellings while
+  // the on-disk data converges from Failed → Error).  These are the only
+  // rows the Retry flow can act on.
+  else if (state.bucketFilter === 'error')          d = d.filter(isError);
   else if (state.bucketFilter === 'selected')       d = d.filter(r => state.selectedIds.has(r.fileID));
 
   if (state.globalSearch.trim()) {
@@ -589,7 +604,10 @@ function renderStatusBadge(val, field, row) {
     const status = rowStatus(row);
     if (status === STATUS.MIGRATED)       return '<span class="status-badge status-migrate-yes">Yes</span>';
     if (status === STATUS.IN_PROCESSING)  return '<span class="status-badge status-in-processing">In Processing</span>';
-    if (status === STATUS.FAILED)         return '<span class="status-badge status-failed">Failed</span>';
+    // Error / Failed are aliases of the same terminal state — render as
+    // "Error" (canonical post-rename) regardless of on-disk spelling.
+    if (status === STATUS.ERROR ||
+        status === STATUS.FAILED)         return '<span class="status-badge status-failed">Error</span>';
     return '<span class="status-no">No</span>';
   }
 
@@ -680,8 +698,14 @@ function renderCell(row, col) {
       const tip = migId ? `Migration ID: ${migId}` : 'Awaiting platform';
       return `<span class="migstatus-cell" title="${esc(tip)}">${badge}</span>`;
     }
-    if (st === STATUS.FAILED) {
-      const badge = `<span class="status-badge status-failed">Failed</span>`;
+    if (st === STATUS.ERROR || st === STATUS.FAILED) {
+      // Retry-count hint helps operators tell a fresh error from one
+      // that's been retried and failed again.  Only shown when > 0 so
+      // it doesn't add noise for the common "first failure" case.
+      const retryHint = retryN > 0
+        ? ` <span class="migstatus-note" title="Retried ${retryN} time${retryN !== 1 ? 's' : ''}">(retry ${retryN})</span>`
+        : '';
+      const badge = `<span class="status-badge status-failed">Error</span>${retryHint}`;
       const note = errMsg
         ? `<span class="migstatus-note" title="${esc(errMsg)}">${esc(errMsg.length > 60 ? errMsg.slice(0, 60) + '…' : errMsg)}</span>`
         : '';
@@ -886,13 +910,18 @@ function getPageIds() {
   return state.filteredData.slice(start, start + state.pageSize).map(r => r.fileID);
 }
 
-// Only selectable rows (Pending or Failed — NOT Migrated or In Processing)
-// on the current page are eligible for the master checkbox / row-click.
+// Which rows on the current page are eligible for the master checkbox
+// / row-click, given the currently selected bucket.
+//   - Error bucket           → only Error/Failed rows (Retry flow)
+//   - every other bucket     → only Pending rows      (Migrate flow)
+// Server-side /api/migrations/retry re-validates identical rules, so this
+// is purely a UX guard.
 function getEligiblePageIds() {
   const start = (state.page - 1) * state.pageSize;
+  const isErrBucket = state.bucketFilter === 'error';
   return state.filteredData
     .slice(start, start + state.pageSize)
-    .filter(isSelectable)
+    .filter(isErrBucket ? isRetrySelectable : isSelectable)
     .map(r => r.fileID);
 }
 
@@ -956,42 +985,96 @@ function attachTableEvents() {
 
 /* ── Toolbar & footer update ────────────────────────────────────────────── */
 function updateToolbar() {
-  // Count only selectable (Pending / Failed) documents among the currently
-  // selected set.  Anything already-migrated or in-flight is defensively
-  // ignored — those states cannot be re-migrated (§15).
-  let sel = 0;
+  // Two mutually-exclusive selection flows depending on which bucket is
+  // active:
+  //
+  //   Error bucket   → the Retry button drives the flow; count Error rows
+  //                    in the current selection.
+  //   Any other      → the Migrate button drives the flow; count Pending
+  //                    rows in the current selection.
+  //
+  // Rows in the other class are silently ignored from the count (server
+  // will re-validate anyway).
+  const isErrorBucket = state.bucketFilter === 'error';
+  let selMigrate = 0;
+  let selRetry   = 0;
   state.selectedIds.forEach(id => {
     const row = state.allData.find(r => r.fileID === id);
-    if (row && isSelectable(row)) sel++;
+    if (!row) return;
+    if (isSelectable(row))       selMigrate++;   // Pending
+    if (isRetrySelectable(row))  selRetry++;     // Error / Failed
   });
+  // For downstream code (counters etc.) `sel` is whichever flow is
+  // currently active.
+  const sel = isErrorBucket ? selRetry : selMigrate;
 
   // Per-user workload lock: server-authoritative flag from /api/contracts
   // and /api/migrations/sync.  When false, this user already has one or
   // more rows in an active migration status they submitted, so we MUST
-  // disable Migrate regardless of selection.  Server enforces the same
-  // rule (returns 409 on /api/migrate) — this is a UX + latency
-  // optimisation, not the enforcement point.
+  // disable Migrate/Retry regardless of selection.  Server enforces the
+  // same rule (returns 409 on /api/migrate and /api/migrations/retry) —
+  // this is a UX + latency optimisation, not the enforcement point.
   const pc         = state.populationCounts || {};
   const canMigrate = (pc.can_migrate !== false);   // default true if unknown
   const myActive   = Number(pc.my_in_processing) || 0;
 
+  // Migrate button — hidden while the user is on the Error bucket
+  // (Retry takes over).  Visible in every other bucket.
   const btn = $('migrate-btn');
-  if (!canMigrate) {
-    btn.textContent = myActive > 0
-      ? `Migrate — ${myActive} of yours in processing`
-      : 'Migrate — batch in progress';
-    btn.disabled = true;
-    btn.className = 'action-migrate-btn locked';
-    btn.title = (
-      `You currently have ${myActive} file${myActive !== 1 ? 's' : ''} `
-      + `in processing.  New migrations can be submitted after your `
-      + `current batch completes.`
-    );
-  } else {
-    btn.textContent = sel > 0 ? `Migrate (${sel})` : 'Migrate';
-    btn.disabled = sel === 0;
-    btn.className = `action-migrate-btn${sel > 0 ? ' active' : ''}`;
-    btn.title = '';
+  if (btn) {
+    if (isErrorBucket) {
+      btn.style.display = 'none';
+    } else {
+      btn.style.display = '';
+      if (!canMigrate) {
+        btn.textContent = myActive > 0
+          ? `Migrate — ${myActive} of yours in processing`
+          : 'Migrate — batch in progress';
+        btn.disabled = true;
+        btn.className = 'action-migrate-btn locked';
+        btn.title = (
+          `You currently have ${myActive} file${myActive !== 1 ? 's' : ''} `
+          + `in processing.  New migrations can be submitted after your `
+          + `current batch completes.`
+        );
+      } else {
+        btn.textContent = selMigrate > 0 ? `Migrate (${selMigrate})` : 'Migrate';
+        btn.disabled = selMigrate === 0;
+        btn.className = `action-migrate-btn${selMigrate > 0 ? ' active' : ''}`;
+        btn.title = '';
+      }
+    }
+  }
+
+  // Retry button — shown only on the Error bucket.  Same locking rules
+  // as Migrate (per-user my_active_total gate), plus at least one row
+  // in the selection must be Error.
+  const retryBtn = $('retry-btn');
+  if (retryBtn) {
+    if (!isErrorBucket) {
+      retryBtn.style.display = 'none';
+      retryBtn.disabled = true;
+      retryBtn.className = 'action-retry-btn';
+    } else {
+      retryBtn.style.display = '';
+      if (!canMigrate) {
+        retryBtn.textContent = myActive > 0
+          ? `Retry — ${myActive} of yours in processing`
+          : 'Retry — batch in progress';
+        retryBtn.disabled = true;
+        retryBtn.className = 'action-retry-btn locked';
+        retryBtn.title = (
+          `You currently have ${myActive} file${myActive !== 1 ? 's' : ''} `
+          + `in processing.  Retries can be submitted after your current `
+          + `batch completes.`
+        );
+      } else {
+        retryBtn.textContent = selRetry > 0 ? `Retry (${selRetry})` : 'Retry';
+        retryBtn.disabled = selRetry === 0;
+        retryBtn.className = `action-retry-btn${selRetry > 0 ? ' active' : ''}`;
+        retryBtn.title = '';
+      }
+    }
   }
 
   // "My Active" indicator next to the selection counter.  Always
@@ -1193,51 +1276,60 @@ function updateBuckets() {
         typeof pc.migrated      === 'number' &&
         typeof pc.pending       === 'number';
 
-  let migrated, inProcessing, yetToBeMigrated;
+  let migrated, inProcessing, yetToBeMigrated, error;
   if (hasServerCounts) {
     migrated        = pc.migrated;
     inProcessing    = pc.in_processing;
-    // "Yet to be Migrated" bundles Pending + Failed (both retry-eligible).
-    yetToBeMigrated = (pc.pending || 0) + (pc.failed || 0);
+    // Error is its own bucket — post-rename it MUST NOT be folded into
+    // Yet-to-be-Migrated (users must go through the Retry flow).  Server
+    // returns `error`; fall back to legacy `failed` key for cached JS
+    // during rollout window.
+    error           = (typeof pc.error === 'number') ? pc.error
+                       : (typeof pc.failed === 'number' ? pc.failed : 0);
+    // "Yet to be Migrated" is Pending only.  Failed/Error rows are
+    // shown in the Error bucket and moved via Retry, not Migrate.
+    yetToBeMigrated = (pc.pending || 0);
   } else {
-    migrated = 0; inProcessing = 0; yetToBeMigrated = 0;
+    migrated = 0; inProcessing = 0; yetToBeMigrated = 0; error = 0;
     state.allData.forEach(r => {
-      switch (rowStatus(r)) {
-        case STATUS.MIGRATED:       migrated++;         break;
-        case STATUS.IN_PROCESSING:  inProcessing++;     break;
-        // Pending + Failed → eligible for migration → "Yet to be Migrated".
-        default:                    yetToBeMigrated++;  break;
-      }
+      const s = rowStatus(r);
+      if      (s === STATUS.MIGRATED)      migrated++;
+      else if (s === STATUS.IN_PROCESSING) inProcessing++;
+      else if (s === STATUS.FAILED ||
+               s === STATUS.ERROR)         error++;
+      else                                 yetToBeMigrated++;   // Pending
     });
   }
   const excluded  = (typeof pc.excluded === 'number')
                       ? pc.excluded
                       : (state.excludedData.length || 0);
-  // A = B + C + D + E  (Total Documents formula).
-  const total = yetToBeMigrated + inProcessing + migrated + excluded;
+  // A = B + C + D + E + F  (Total Documents formula — Error included).
+  const total = yetToBeMigrated + inProcessing + migrated + error + excluded;
 
   const setVal = (id, v) => { const el = $(id); if (el) el.textContent = v.toLocaleString(); };
   setVal('bucket-total',           total);
   setVal('bucket-migrated',        migrated);
   setVal('bucket-pending',         yetToBeMigrated);
   setVal('bucket-in-processing',   inProcessing);
+  setVal('bucket-error',           error);
   setVal('bucket-excluded',        excluded);
 
   // Live formula tooltip on the Total bucket:
-  //   "B + C + D + E   <hover>  500 + 20 + 110 + 10 = 640"
+  //   "B + C + D + E + F   <hover>  500 + 20 + 110 + 2 + 10 = 642"
   // Values are dynamic — nothing is hardcoded.
   const formulaEl = $('bucket-total-formula');
   if (formulaEl) {
     const parts = `${yetToBeMigrated.toLocaleString()} + ${inProcessing.toLocaleString()} + `
-                + `${migrated.toLocaleString()} + ${excluded.toLocaleString()}`;
+                + `${migrated.toLocaleString()} + ${error.toLocaleString()} + `
+                + `${excluded.toLocaleString()}`;
     formulaEl.setAttribute(
       'title',
-      `B + C + D + E\n${parts} = ${total.toLocaleString()}`
+      `B + C + D + E + F\n${parts} = ${total.toLocaleString()}`
     );
     formulaEl.setAttribute(
       'aria-label',
       `Total Documents formula: B (${yetToBeMigrated}) + C (${inProcessing}) + `
-      + `D (${migrated}) + E (${excluded}) = ${total}`
+      + `D (${migrated}) + E (${error}) + F (${excluded}) = ${total}`
     );
   }
 
@@ -2345,6 +2437,23 @@ class ActiveMigrationLockError extends Error {
   }
 }
 
+// Thrown by retryService.retry() when the server rejects the request
+// because one or more FileIDs aren't currently in the Error bucket
+// (400 + detail.reason='INELIGIBLE_FOR_RETRY').  performRetry() catches
+// this specifically so we can rehydrate state (a stale client selection
+// probably included a Migrated/Pending row) and show a targeted toast.
+class RetryIneligibleError extends Error {
+  constructor(detail) {
+    super(detail && detail.message ? detail.message
+          : 'Some of the selected rows are no longer in the Error bucket.');
+    this.name       = 'RetryIneligibleError';
+    this.reason     = 'INELIGIBLE_FOR_RETRY';
+    this.ineligible = (detail && Array.isArray(detail.ineligible)) ? detail.ineligible : [];
+    this.unknown    = (detail && Array.isArray(detail.unknown))    ? detail.unknown    : [];
+    this.eligible   = (detail && Array.isArray(detail.eligible))   ? detail.eligible   : [];
+  }
+}
+
 const migrationService = {
   async migrate(ids) {
     const res = await fetch('/api/migrate', {
@@ -2392,6 +2501,58 @@ const migrationService = {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
+  },
+};
+
+/* ── Retry service ─────────────────────────────────────────────────────────
+ * Talks to POST /api/migrations/retry.  Response shape is identical to
+ * /api/migrate (see migrationService.migrate above), plus a `retryHistory`
+ * array of audit-row snapshots (used only for the confirmation toast /
+ * debug tooling — the browser doesn't render them).
+ *
+ * Error mapping mirrors migrationService.migrate but adds a third case:
+ *   400 + INELIGIBLE_FOR_RETRY → RetryIneligibleError (client selection
+ *                                included a row that isn't Error).
+ * ────────────────────────────────────────────────────────────────────────── */
+const retryService = {
+  async retry(ids) {
+    const res = await fetch('/api/migrations/retry', {
+      method:      'POST',
+      credentials: 'same-origin',
+      headers:     { 'content-type': 'application/json' },
+      body:        JSON.stringify({ ids: [...ids] }),
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      let detail = null;
+      try {
+        const j = await res.json();
+        detail = j.detail;
+        if (detail) msg = (typeof detail === 'string') ? detail : (detail.message || msg);
+      } catch {}
+      if (res.status === 409 && detail && typeof detail === 'object'
+          && detail.reason === 'ACTIVE_MIGRATION_EXISTS') {
+        throw new ActiveMigrationLockError(detail.activeCount, detail.message);
+      }
+      if (res.status === 400 && detail && typeof detail === 'object'
+          && detail.reason === 'INELIGIBLE_FOR_RETRY') {
+        throw new RetryIneligibleError(detail);
+      }
+      throw new Error(msg);
+    }
+    const json = await res.json();
+    return {
+      runId:               json.runId || null,
+      migrationRequestIds: Array.isArray(json.migrationRequestIds) ? json.migrationRequestIds : [],
+      inProcessing:        Array.isArray(json.inProcessing) ? json.inProcessing : [],
+      submitted:           (json.submitted && typeof json.submitted === 'object') ? json.submitted : {},
+      failed:              Array.isArray(json.failed)  ? json.failed  : [],
+      skipped:             Array.isArray(json.skipped) ? json.skipped : [],
+      invalid:             Array.isArray(json.invalid) ? json.invalid : [],
+      groups:              Array.isArray(json.groups)  ? json.groups  : [],
+      retryHistory:        Array.isArray(json.retryHistory) ? json.retryHistory : [],
+      error:               json.error || null,
+    };
   },
 };
 
@@ -2475,7 +2636,10 @@ async function performMigration(ids) {
         if (fids.includes(r.fileID)) { r.migrationRequestId = mid; break; }
       }
     } else if (failedMap.has(r.fileID)) {
-      r.migrationStatus = STATUS.FAILED;
+      // Canonical spelling post-rename.  Server writes 'Error' too; the
+      // legacy 'Failed' string only exists in on-disk rows that predate
+      // the rename.
+      r.migrationStatus = STATUS.ERROR;
       r.errorMessage    = failedMap.get(r.fileID) || r.errorMessage || '';
     }
   });
@@ -2514,6 +2678,211 @@ async function performMigration(ids) {
   // background submission is running.  The very first poll tick fires
   // immediately (see start()) so counts refresh within ~200ms of the
   // click, without waiting for the full interval.
+  if (inProcessingSet.size > 0) {
+    migrationPoller.start();
+  }
+}
+
+/* ── Retry modal + retry flow ───────────────────────────────────────────────
+ * Mirrors openMigrateModal + performMigration exactly, but for the Error
+ * bucket.  Selection is filtered through isRetrySelectable (Error/Failed
+ * only) rather than isSelectable (Pending only).  On success, submitted
+ * rows flip to In Processing exactly like the Migrate flow — the sync
+ * poller then observes the eventual terminal outcome.
+ * ────────────────────────────────────────────────────────────────────── */
+function openRetryModal() {
+  const pc = state.populationCounts || {};
+  // Same per-user lock guard as openMigrateModal.
+  if (pc.can_migrate === false) {
+    const n = Number(pc.my_in_processing) || 0;
+    showToast(
+      `You currently have ${n} file${n !== 1 ? 's' : ''} in processing. `
+      + `Retries can be submitted after your current batch completes.`
+    );
+    return;
+  }
+
+  // Only Error/Failed rows may be retried (isRetrySelectable).
+  const eligible = [...state.selectedIds].filter(id => {
+    const row = state.allData.find(r => r.fileID === id);
+    return row && isRetrySelectable(row);
+  });
+  const n = eligible.length;
+  if (n === 0) return;
+
+  // Group preview reuses the Migrate flow's grouper — same site/library/
+  // folder tuples land in the same platform-side migration_id space.
+  const groups = _summariseMigrateSelection(eligible);
+  const groupsHtml = groups.length
+    ? `<div class="migrate-groups">
+         ${groups.map(g => `
+           <div class="migrate-group">
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">From</span>
+               <span class="migrate-group-value" title="${_escapeHtml(g.sourceDisplay)}">${_escapeHtml(g.sourceDisplay)}</span>
+             </div>
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">To</span>
+               <span class="migrate-group-value" title="${_escapeHtml(g.destinationDisplay)}">${_escapeHtml(g.destinationDisplay)}</span>
+             </div>
+             <div class="migrate-group-row">
+               <span class="migrate-group-label">Files</span>
+               <span class="migrate-group-value">${g.count}</span>
+             </div>
+           </div>`).join('')}
+       </div>`
+    : `<div class="migrate-groups migrate-groups-empty">
+         Unable to determine source folders for the selection. The server
+         will validate each file before submission.
+       </div>`;
+
+  const migrationCount = groups.length;
+  const migrationCountLabel = migrationCount === 1
+    ? '1 migration request'
+    : `${migrationCount} migration requests`;
+
+  const html = `
+    <div class="modal-overlay" id="modal-overlay">
+      <div class="modal modal-wide">
+        <div class="modal-header">
+          <span class="modal-title">Retry Failed Migrations</span>
+        </div>
+        <div class="modal-body">
+          <p class="modal-lead">
+            <strong>${n}</strong> failed document${n !== 1 ? 's' : ''} will be
+            <b>resubmitted</b> to the Migration Platform
+            (${migrationCountLabel}).
+          </p>
+          ${groupsHtml}
+          <div class="modal-note">
+            <b>What happens:</b> the previous failure details
+            (MigrationRequestId, ErrorMessage, RetryCount) are archived
+            to an audit table first, then each row flips back to
+            <b>In Processing</b> and is resubmitted through the same
+            migration platform pipeline that Migrate uses. A row that
+            fails again returns to the Error bucket for another retry.
+            <br><br>
+            <b>Your source files are not modified or deleted</b> — this is
+            a one-way copy, exactly like the initial Migrate flow.
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-cancel-modal" id="modal-cancel">Cancel</button>
+          <button class="btn-confirm-modal" id="modal-confirm">Retry Selected</button>
+        </div>
+      </div>
+    </div>`;
+
+  const mount = document.createElement('div');
+  mount.id = 'modal-mount';
+  document.body.appendChild(mount);
+  mount.innerHTML = html;
+
+  $('modal-cancel').addEventListener('click', () => mount.remove());
+  $('modal-overlay').addEventListener('click', e => { if (e.target === $('modal-overlay')) mount.remove(); });
+  $('modal-confirm').addEventListener('click', async () => {
+    mount.remove();
+    await performRetry(new Set(eligible));
+  });
+}
+
+async function performRetry(ids) {
+  // Guard: only Error/Failed rows may be sent.
+  const eligibleIds = [...ids].filter(id => {
+    const row = state.allData.find(r => r.fileID === id);
+    return row && isRetrySelectable(row);
+  });
+  if (!eligibleIds.length) {
+    showToast('No eligible Error documents to retry.');
+    return;
+  }
+
+  const btn    = $('retry-btn');
+  const oldTxt = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Submitting…';
+  }
+
+  // Reuse the same progress badge — the underlying pipeline is identical.
+  migProgress.startSubmitting(eligibleIds.length);
+
+  let result;
+  try {
+    result = await retryService.retry(eligibleIds);
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = oldTxt; }
+    migProgress.hide();
+    if (err && err.name === 'ActiveMigrationLockError') {
+      state.populationCounts = {
+        ...state.populationCounts,
+        my_in_processing: err.activeCount,
+        my_active_total:  err.activeCount,
+        can_migrate:      false,
+      };
+      applyFiltersAndSort();
+      renderAll();
+      showToast(err.message);
+      return;
+    }
+    if (err && err.name === 'RetryIneligibleError') {
+      // Stale selection — trigger a full refetch so buckets + row
+      // statuses realign with the server, and drop the bad ids from
+      // the current selection.  The row-level guard above will catch
+      // any that stayed selected on the next click.
+      const bad = new Set([
+        ...err.ineligible.map(x => x.fileID),
+        ...err.unknown,
+      ]);
+      bad.forEach(id => state.selectedIds.delete(id));
+      showToast(err.message);
+      // Force a full data refresh — cheapest way to reconcile.
+      migrationPoller.tickOnce().catch(() => {});
+      return;
+    }
+    showToast(`Could not submit retry: ${err.message || err}`);
+    return;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldTxt; }
+  }
+
+  // Mirror server state locally — same code path as performMigration.
+  const inProcessingSet = new Set(result.inProcessing);
+  const failedMap       = new Map(result.failed.map(f => [f.fileID, f.error]));
+  const submittedByMigrationId = result.submitted || {};
+
+  state.allData.forEach(r => {
+    if (inProcessingSet.has(r.fileID)) {
+      r.migrationStatus = STATUS.IN_PROCESSING;
+      // Clear the error message the row was carrying while in Error — the
+      // audit copy already captured it in ContractMigrationRetryHistory
+      // and a fresh submission has no error yet.  If the retry fails
+      // again, the sync poller will populate a new ErrorMessage.
+      r.errorMessage = '';
+      for (const [mid, fids] of Object.entries(submittedByMigrationId)) {
+        if (fids.includes(r.fileID)) { r.migrationRequestId = mid; break; }
+      }
+    } else if (failedMap.has(r.fileID)) {
+      r.migrationStatus = STATUS.ERROR;
+      r.errorMessage    = failedMap.get(r.fileID) || r.errorMessage || '';
+    }
+  });
+
+  inProcessingSet.forEach(id => state.selectedIds.delete(id));
+  failedMap.forEach((_e, id) => state.selectedIds.delete(id));
+
+  applyFiltersAndSort();
+  renderAll();
+
+  migProgress.onSubmitted(result);
+
+  const nInv  = result.invalid.length;
+  const nSkip = result.skipped.length;
+  const extraParts = [];
+  if (nInv  > 0) extraParts.push(`${nInv} rejected (bad SharePoint path)`);
+  if (nSkip > 0) extraParts.push(`${nSkip} skipped (already processed)`);
+  if (extraParts.length > 0) showToast(extraParts.join(' · '));
+
   if (inProcessingSet.size > 0) {
     migrationPoller.start();
   }
@@ -2701,7 +3070,25 @@ const migrationPoller = (function () {
 
   function isRunning() { return timer != null; }
 
-  return { start, stop, isRunning, _tick: tick };
+  /** Public trigger for a single refresh cycle — used by the manual
+   *  Refresh button in the toolbar.  Returns the same promise `tick()`
+   *  resolves to, so the caller can `await` it to know when the
+   *  refresh has finished (button re-enable, spinner off, etc.).
+   *
+   *  Reuses `tick()` verbatim so:
+   *    - the same inFlight overlap guard applies (a manual click while
+   *      an auto-tick is in flight is a no-op, not a duplicate refresh);
+   *    - the same scroll snapshot/restore runs;
+   *    - the same error-burst suppression logic applies;
+   *    - all filters/page/sort/columns are preserved (tick() delegates
+   *      to refreshContractRows() + applyFiltersAndSort(), neither of
+   *      which touches user UI state).
+   *
+   *  Does NOT stop or restart the auto-refresh timer — the manual
+   *  refresh is purely additive to the existing 5-s cadence. */
+  async function refreshNow() { await tick(); }
+
+  return { start, stop, isRunning, refreshNow, _tick: tick };
 })();
 
 /** Re-fetch /api/contracts and rebuild state.allData from the server
@@ -3534,6 +3921,7 @@ function _bucketSlugForExport() {
     case 'migrated':      return 'migrated';
     case 'in_processing': return 'in_processing';
     case 'pending':       return 'yet_to_be_migrated';
+    case 'error':         return 'error';
     case 'selected':      return 'selected';
     case 'all':
     default:              return 'all';
@@ -3665,8 +4053,41 @@ function initReviewEventListeners() {
 
   $('col-btn').addEventListener('click', openColPanel);
   $('migrate-btn').addEventListener('click', openMigrateModal);
+  const _retryBtn = $('retry-btn');
+  if (_retryBtn) _retryBtn.addEventListener('click', openRetryModal);
   $('exclude-btn').addEventListener('click', openExcludeModal);
   $('export-csv-btn').addEventListener('click', exportCsv);
+
+  // Manual Refresh button — force-runs one poll cycle immediately.
+  // Reuses migrationPoller.refreshNow() (which is the same tick() the
+  // 5-s auto-refresh uses), so bucket counts / table rows / My Active
+  // all update through the existing code path.  Filters, search text,
+  // folder filter, pagination, sort, and visible columns are preserved
+  // because tick() delegates to refreshContractRows() +
+  // applyFiltersAndSort(), neither of which touches user UI state.
+  const _refreshBtn = $('refresh-btn');
+  if (_refreshBtn) {
+    _refreshBtn.addEventListener('click', async () => {
+      if (_refreshBtn.disabled) return;
+      const labelEl = _refreshBtn.querySelector('.tb-refresh-label');
+      const oldLabel = labelEl ? labelEl.textContent : '';
+      _refreshBtn.disabled = true;
+      _refreshBtn.classList.add('is-refreshing');
+      if (labelEl) labelEl.textContent = 'Refreshing…';
+      try {
+        await migrationPoller.refreshNow();
+      } catch (_) {
+        // migrationPoller.refreshNow() swallows its own errors and shows
+        // the "Auto-refresh temporarily unavailable" toast after a
+        // failure burst — nothing extra to surface for a single manual
+        // click.
+      } finally {
+        _refreshBtn.disabled = false;
+        _refreshBtn.classList.remove('is-refreshing');
+        if (labelEl) labelEl.textContent = oldLabel || 'Refresh';
+      }
+    });
+  }
   // Same handler for the Export CSV button in the Excluded view header.
   // exportCsv() inspects state.currentView and exports state.excludedData
   // when the user is looking at Excluded — so "Excluded selected → export
