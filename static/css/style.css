@@ -2678,3 +2678,376 @@ tr.row-in-processing:hover td { background: #f3ecfe !important; }
   font-family: inherit;
 }
 .folder-crumb-clear:hover { background: #fff; color: #b42318; border-color: #f5b5ad; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   RESPONSIVE LAYOUT (2026-09-24)
+   ══════════════════════════════════════════════════════════════════════════
+   Desktop-first strategy: the base rules above are optimised for ≥1200px
+   screens (the original layout).  The blocks below progressively RELAX
+   fixed widths / rigid grid placements as the viewport narrows, without
+   changing colors, badges, buttons, or the table row rendering.
+   Breakpoints (adapt existing values, no separate mobile stylesheet):
+     ≥1200px  desktop      — untouched, matches the original design
+      <1200px large tablet — buckets go to 3 columns, toolbar wraps
+      <1024px tablet       — 2 bucket columns, action bar wraps
+       <768px mobile       — 1–2 bucket columns, full-width search,
+                             stacked header, full-width primary actions
+       <480px small mobile — 1 bucket column, tighter paddings
+   The horizontal-scroll TABLE stays scrollable inside its own container
+   at every size — we never force the full table width into the viewport.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Universal safety guards ─────────────────────────────────────────────
+   Applied at every viewport so the fixed-100vw shell never bleeds when
+   long strings (SharePoint URLs, agreement names) enter the flow. */
+#app {
+  /* Kill horizontal overflow from any deeply-nested wide element — the
+     table gets its own scroll container so this is safe.  Without this
+     the sticky frozen columns + long file names would drag the whole
+     page sideways on narrow screens. */
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+.grid-wrap {
+  /* Flex children default to min-content; without min-width:0 the table
+     forces its parent (and the flex-column shell) to grow to the widest
+     row, defeating the .table-container's horizontal scroll. */
+  min-width: 0;
+}
+
+.table-container {
+  /* Explicitly authorise horizontal scroll here (was inherited via
+     `overflow: auto` — spelled out so nested min-width:0 chains don't
+     accidentally collapse it into hidden). */
+  overflow-x: auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── Large-tablet (<1200px) ──────────────────────────────────────────────
+   Bucket row drops to 3 columns and the Refresh button flows with the
+   cards instead of being pinned to grid col 5. */
+@media (max-width: 1199px) {
+  .app-header  { padding: 0 20px; }
+  .toolbar     { padding: 0 16px; }
+  .action-bar  { padding: 10px 16px; }
+  .buckets     { padding: 10px 16px; }
+
+  /* Replace the rigid 5-col grid with an auto-fitting responsive grid.
+     minmax(180px, 1fr) means each card gets AT LEAST 180px; the grid
+     packs as many per row as the viewport allows.  This also frees the
+     Refresh slot from its (row 2 / col 5) pin — unset those below. */
+  .buckets {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+  .buckets > .bucket-total,
+  .buckets > .bucket-pending,
+  .buckets > .bucket-in-processing,
+  .buckets > .bucket-migrated,
+  .buckets > .bucket-error,
+  .buckets > .bucket-excluded,
+  .buckets > .bucket-refresh-slot {
+    grid-row: auto;
+    grid-column: auto;
+  }
+  /* Refresh cell no longer needs to hug the right edge — center-align
+     it inside its wrapped cell so it doesn't visually float alone. */
+  .bucket-refresh-slot {
+    justify-content: stretch;
+  }
+  .bucket-refresh-slot .tb-refresh-btn {
+    width: 100%;
+  }
+
+  /* Toolbar wraps into a second row if content overflows.  Left cluster
+     keeps its horizontal ordering; Export CSV drops to the next line
+     rather than being clipped. */
+  .toolbar {
+    flex-wrap: wrap;
+    height: auto;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    gap: 8px;
+  }
+  .tb-left {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
+/* ── Tablet (<1024px) ────────────────────────────────────────────────────
+   Buckets to ~2 columns, action-bar wraps so pager can drop to its own
+   line without colliding with the centered actions. */
+@media (max-width: 1023px) {
+  .buckets {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+  }
+  .bucket { padding: 8px 10px; }
+  .bucket-label { font-size: 10px; }
+  .bucket-value { font-size: 17px; }
+
+  /* Action bar: switch from 3-col grid to a wrapping flex row.  Centered
+     group stays centered; pager wraps to a new line on the right when
+     there isn't room for both on one row. */
+  .action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    row-gap: 10px;
+    column-gap: 16px;
+  }
+  .action-bar .action-center-group {
+    /* Reset the grid-column pin from the desktop rule. */
+    grid-column: auto;
+    justify-self: auto;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
+  }
+  .action-bar .pager {
+    grid-column: auto;
+    justify-self: auto;
+    margin-left: auto;   /* keep pager right-aligned when it fits inline */
+  }
+}
+
+/* ── Mobile (<768px) ─────────────────────────────────────────────────────
+   Header stacks (title on top, email+Logout right-aligned second row);
+   buckets 1–2 per row; search takes full width; primary actions
+   stretch to the full row so they remain easy to tap. */
+@media (max-width: 767px) {
+  html, body { font-size: 13px; }
+
+  /* ── Mobile shell + table horizontal-scroll fix (2026-09-24) ───────────
+     Root cause of "can't scroll the table to the far right on mobile":
+       Base desktop uses a fixed #app { height:100vh; overflow:hidden } shell,
+       so .grid-wrap { flex:1; overflow:hidden } + .table-container
+       { width:100%; height:100% } clip the table and hand horizontal scroll
+       to .table-container.  On mobile we previously switched #app to
+       { height:auto; overflow-y:auto } to allow vertical page scroll — that
+       broke the constraint chain: .grid-wrap had no bounded height/width,
+       so it grew to the table's ideal (columns-sum) width, .table-container
+       inherited that inflated width, so it never had a reason to overflow,
+       and the rightmost columns became unreachable because #app itself
+       still has overflow-x:hidden (correctly, so the whole page doesn't
+       scroll sideways).
+     Fix: rebind the horizontal-scroll boundary to the viewport on mobile.
+       - #app stays overflow-x:hidden (page never scrolls sideways).
+       - .grid-wrap and .table-container are explicitly width:100% and
+         max-width:100% with min-width:0, so they cannot exceed the
+         viewport width regardless of the table's natural width.
+       - .table-container is the ONLY horizontal scroller.
+       - .excel-table drops its base min-width:100% and uses width:max-content
+         so it sizes to its columns' natural widths (all dynamic columns
+         included) and overflows its container horizontally, engaging the
+         .table-container scrollbar. */
+  #app { height: auto; min-height: 100vh; overflow-y: auto; overflow-x: hidden; }
+  .screen-review {
+    min-height: 0;
+    /* Bound the review screen to the viewport width so nested table cannot
+       push it wider.  Without this, screen-review's default flex-item
+       behaviour would let it grow to the table's ideal width. */
+    width: 100%;
+    max-width: 100vw;
+    min-width: 0;
+  }
+  .grid-wrap {
+    /* Explicit viewport-bounded width — the constraint the table scroller
+       needs to have something to overflow against. */
+    width: 100%;
+    max-width: 100vw;
+    min-width: 0;
+    /* Give the grid a real height on mobile so its child .table-container
+       (which is height:100%) has room to render.  60vh keeps buckets +
+       toolbar + action bar visible without competing for space. */
+    min-height: 60vh;
+    overflow: hidden;   /* clip so table-container becomes the scroller */
+  }
+  .table-container {
+    /* THE horizontal scroller on mobile.  overflow-x:auto lets the wide
+       table scroll left/right inside this fixed-viewport-width box while
+       the rest of the page stays put. */
+    width: 100%;
+    max-width: 100vw;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .excel-table {
+    /* Let the table size to its columns' natural widths — do NOT constrain
+       to 100% on mobile or dynamic columns collapse and the scroller has
+       nothing to scroll.  width:max-content honours every column's
+       min-width / width so the sum is the table's real content width. */
+    width: max-content;
+    min-width: 100%;   /* still fill the viewport when few columns are visible */
+    table-layout: fixed;
+  }
+
+  /* Header: title on row 1, session badge (email + Logout) on row 2 aligned
+     to the right.  Uses flex-wrap so no absolute positioning is needed. */
+  .app-header {
+    height: auto;
+    min-height: 56px;
+    padding: 10px 14px;
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .app-brand { flex: 1 1 100%; }
+  .app-title { font-size: 16px; white-space: normal; line-height: 1.2; }
+  .app-user {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .app-user-email { max-width: 60vw; font-size: 11.5px; }
+  .app-user-logout { height: 30px; padding: 0 14px; }
+
+  /* Buckets on mobile — sized so every label + count fits on one line.
+     Previous minmax(140px, 1fr) was too tight for "YET TO BE MIGRATED"
+     (~130px at 10.5px uppercase) + its numeric value, which pushed the
+     count off the right edge of the card.  200px floor guarantees the
+     longest label ("YET TO BE MIGRATED") + a 3-digit value (like 628 or
+     1234) coexist with padding.
+     Result on typical phones:
+       ≥400px viewport → 1 card per row (200px + 24px padding > 200px+gap)
+       ≥480px viewport → still 1 card (single column pinned in <480px block
+                         below, so this rule only applies to 480–767px). */
+  .buckets {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  /* Slim tag so more room is left for the label + value. */
+  .bucket-tag { width: 20px; height: 20px; font-size: 10px; }
+  /* Keep label legible — do NOT shrink further, users need to read it. */
+  .bucket-label { font-size: 10.5px; }
+  .bucket-value { font-size: 17px; }
+  .bucket-formula { display: none; } /* keep the number, drop the caption */
+  /* Give the body a real gap and left-align so label+value never overlap. */
+  .bucket-body { gap: 10px; }
+
+  /* Toolbar: search takes the full row; every other control wraps into
+     the next row(s) at natural button width.  Export CSV pushes to the
+     end when it fits, drops below when it doesn't. */
+  .toolbar {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+  .tb-search { flex: 1 1 100%; }
+  .tb-search input { width: 100%; }
+  .tb-left {
+    width: 100%;
+    gap: 6px;
+  }
+  .tb-right {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  .tb-btn { height: 32px; font-size: 12px; padding: 0 12px; }
+  .tb-refresh-btn { width: 100%; justify-content: center; }
+  .bucket-refresh-slot { grid-column: 1 / -1; }
+
+  /* Action bar: primary actions stretch to fill the row so they are
+     tap-friendly; pager drops to its own row centered underneath. */
+  .action-bar {
+    padding: 10px 12px;
+    row-gap: 8px;
+  }
+  .action-center-group {
+    width: 100%;
+    justify-content: space-between;
+    gap: 8px !important;
+  }
+  .action-migrate-btn,
+  .action-retry-btn,
+  .action-exclude-btn,
+  .action-restore-btn {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0 12px;
+  }
+  .action-sel-count { flex: 1 1 100%; text-align: center; order: -1; }
+  .action-bar .pager {
+    width: 100%;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-left: 0;
+  }
+
+  /* Excluded view header: title + Export CSV stack vertically. */
+  .excluded-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px 12px 10px;
+  }
+
+  /* Column-picker popup: fit to viewport, scroll vertically for long lists.
+     min(320px, calc(100vw - 24px)) never exceeds the screen while keeping
+     the desktop-friendly width when there is room. */
+  .colpanel {
+    width: min(320px, calc(100vw - 24px));
+    max-height: min(70vh, calc(100vh - 140px));
+  }
+
+  /* Folder-filter popover: same treatment. */
+  .folder-filter-panel {
+    width: min(320px, calc(100vw - 24px));
+    max-height: min(75vh, calc(100vh - 140px));
+    overflow-y: auto;
+  }
+
+  /* Column filter panel (per-column filter) — was hard-coded 320px wide
+     with fixed max-height.  Cap both so it never exceeds the viewport. */
+  .fp-panel {
+    width: min(320px, calc(100vw - 20px));
+    max-height: min(80vh, calc(100vh - 80px));
+  }
+}
+
+/* ── Small mobile (<480px) ───────────────────────────────────────────────
+   Extra-tight paddings; buckets go single-column so the full
+   "TOTAL DOCUMENTS ....... 642" pattern always fits on one line even at
+   375/390/430px viewports. */
+@media (max-width: 479px) {
+  .app-header  { padding: 8px 10px; }
+  .toolbar     { padding: 6px 10px; }
+  .action-bar  { padding: 8px 10px; }
+  .buckets     {
+    padding: 8px 10px;
+    grid-template-columns: 1fr;   /* single column — every count fits */
+    gap: 6px;
+  }
+  .bucket { padding: 10px 12px; }
+  /* On the narrowest phones (375–430px) keep the numeric value clearly
+     legible; the label+value are on the same row with space-between so
+     the value hugs the right edge of the card. */
+  .bucket-label { font-size: 11px; }
+  .bucket-value { font-size: 18px; }
+  .app-title { font-size: 15px; }
+  .app-user-email { max-width: 55vw; }
+
+  .tb-btn { padding: 0 10px; }
+  .action-center-group {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .action-migrate-btn,
+  .action-retry-btn,
+  .action-exclude-btn,
+  .action-restore-btn {
+    width: 100%;
+  }
+  .action-sel-count { order: -1; }
+
+  /* Popovers: same cap but with tighter viewport margin. */
+  .colpanel,
+  .folder-filter-panel,
+  .fp-panel {
+    width: min(320px, calc(100vw - 12px));
+  }
+}
