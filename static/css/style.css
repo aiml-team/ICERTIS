@@ -1021,6 +1021,17 @@ html, body {
   flex-shrink: 0;
 }
 
+/* Frozen "Row No." header — clickable to toggle sort direction.
+   Subtle hover cue so the affordance is discoverable without changing
+   the frozen column's background (which must stay opaque for sticky
+   occlusion). */
+.excel-table th.th-sortable {
+  user-select: none;
+}
+.excel-table th.th-sortable:hover {
+  background: #dfe6ee;
+}
+
 /* Filter button — real control, not a decoration */
 .th-filter-btn {
   flex-shrink: 0;
@@ -1093,9 +1104,14 @@ html, body {
   position: sticky;
 }
 
+/* Widened col-0 (Row No.) from 40px→80px on 2026-09-24 so the header
+   label "Row No." + sort caret fit without truncation.  The two
+   downstream frozen columns' left offsets must shift by the same delta
+   (+40px) so their sticky positions still line up flush with col-0's
+   right edge. */
 .col-frozen-0 { left: 0; }
-.col-frozen-1 { left: 40px; }
-.col-frozen-2 { left: 84px; }
+.col-frozen-1 { left: 80px; }
+.col-frozen-2 { left: 124px; }
 
 /* ── tbody ─────────────────────────────────────────────────────────────── */
 .excel-table tbody tr {
@@ -1719,6 +1735,10 @@ thead .cell-rn {
 }
 
 .colpanel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 4px 12px 6px;
   font-weight: 700;
   font-size: 11px;
@@ -1727,6 +1747,26 @@ thead .cell-rn {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+
+/* Global Show all / Hide all pair at the top of the Columns dropdown.
+   Replaced the per-section group buttons per manager request 2026-09-24
+   — one pair now acts across every section at once. */
+.colpanel-global-actions { display: inline-flex; gap: 8px; }
+
+.colpanel-global-btn {
+  background: transparent;
+  border: none;
+  color: #0f6cbd;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.colpanel-global-btn:hover { text-decoration: underline; }
 
 .colpanel-row {
   display: flex;

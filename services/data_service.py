@@ -49,6 +49,7 @@ from core.database import (
     ensure_migration_integration_columns,
     ensure_migration_status_column,
     ensure_retry_history_table,
+    ensure_row_number_column,
     ensure_submitted_by_column,
     exclusion_audit_table_name,
     excluded_table_name,
@@ -148,10 +149,12 @@ def _ensure_schema_once() -> None:
         ensure_folder_columns()
         ensure_migration_integration_columns()
         ensure_submitted_by_column()               # per-user workload lock
+        ensure_row_number_column()                 # permanent sequential "#"
         ensure_exclusion_audit_table()
         ensure_retry_history_table()               # retry audit trail
         _migrate_legacy_excluded_table_back()      # one-shot back-migration
         backfill_folder_columns()
+        _backfill_row_numbers_one_shot()           # number existing NULL rows
         _schema_ready = True
     except Exception as exc:
         logger.warning("_ensure_schema_once() failed: %s", exc)
@@ -281,6 +284,9 @@ _BASE_COLUMNS = [
     "Id", "FolderName", "FolderType", "BatchID", "BatchNumber",
     "PageCount", "TextCharacters",
     "EndCustomerName", "QuoteID", "AnnualFeeIncrease", "FeeIncreaseDate",
+    # Permanent per-file sequential number ("#" column in the UI).  Added
+    # LAST so downstream index-based access into _COLUMNS stays stable.
+    "RowNumber",
 ]
 
 # Folder1..Folder20 columns — appended AFTER the base columns so index-based
@@ -371,6 +377,13 @@ _FOLDER_ROOT_LABEL      = "All Contracts"
 _TECHNICAL_SEG_RE       = _re.compile(r"^(shared\s*documents|documents|forms|allitems\.aspx?)$", _re.I)
 _FILE_EXT_RE            = _re.compile(r"\.[A-Za-z0-9]{1,6}$")
 _HTTP_RE                = _re.compile(r"^https?://", _re.I)
+# The document library at the site root is named "Contracts" — same word
+# also appears as a real folder further down (e.g.
+#   /sites/US-Contracts_Management/Contracts/All Contracts/Contracts/Client/…
+#    library-name-^^^^^^^^^^^                 real-folder-^^^^^^^^^
+# ).  We strip it ONLY when it is the very first segment after the
+# /sites/<site>/ prefix so the inner "Contracts" folder is preserved.
+_LIBRARY_NAME_LEADING   = "Contracts"
 
 
 def folder_segments_for(sharepoint_path: str | None) -> list[str]:
@@ -383,7 +396,11 @@ def folder_segments_for(sharepoint_path: str | None) -> list[str]:
       • decode percent-encoded segments
       • drop technical segments (Shared Documents, Forms, AllItems.aspx…)
       • drop the trailing filename (last segment whose extension is 1-6 alnum)
-      • collapse literal "All Contracts" segments (virtual root)
+
+    "All Contracts" is a REAL folder in the SharePoint hierarchy — it is
+    preserved verbatim (was previously collapsed as a "virtual root" but
+    that hid a level the business asked to see).  The value shows up
+    exactly as it does in the URL path.
     """
     if not sharepoint_path or not isinstance(sharepoint_path, str):
         return []
@@ -398,6 +415,12 @@ def folder_segments_for(sharepoint_path: str | None) -> list[str]:
             return []
         if parts and parts[0].lower() == "sites" and len(parts) >= 2:
             parts = parts[2:]
+        # Strip the SharePoint document-library name when it's the very
+        # first segment (see _LIBRARY_NAME_LEADING).  Only touches the
+        # LEADING occurrence — an identically-named real folder deeper
+        # in the tree is preserved verbatim.
+        if parts and parts[0].lower() == _LIBRARY_NAME_LEADING.lower():
+            parts = parts[1:]
         segs = parts
     else:
         segs = [p for p in s.replace("\\", "/").split("/") if p]
@@ -416,7 +439,7 @@ def folder_segments_for(sharepoint_path: str | None) -> list[str]:
     if _FILE_EXT_RE.search(decoded[-1]):
         decoded.pop()
 
-    return [seg for seg in decoded if seg.lower() != _FOLDER_ROOT_LABEL.lower()]
+    return decoded
 
 
 def folder_columns_from_path(sharepoint_path: str | None) -> list[str | None]:
@@ -452,24 +475,50 @@ def backfill_folder_columns() -> None:
         _backfill_folder_columns_for(table)
 
 
+# One-shot per process: run the stale-parser re-derivation exactly once
+# on the first /api/contracts hit after startup.  Any parser change
+# ships as a code deploy → new process → this fires once → subsequent
+# reads skip the O(N) scan.  New rows added while the process is
+# running are still caught by the NULL-scan path on every read.
+_stale_folder_check_done = False
+
+
 def backfill_folder_columns_if_needed() -> int:
     """Live-backfill worker for the ACTIVE inventory only.
 
-    Cheaper twin of `backfill_folder_columns()` — skips the legacy
-    `_Excluded` sidecar table (which we no longer write to) and returns
-    the number of rows that were updated so the caller can log volume.
+    Two update paths:
 
-    Runs on every /api/contracts read; the initial SELECT is `WHERE
-    (Folder01 IS NULL AND ... Folder20 IS NULL) AND SharePointPath IS
-    NOT NULL` which returns zero rows once the inventory is caught up —
-    so the steady-state cost is a single indexed lookup per read.
+      A. (Every read) Rows with ALL Folder01..20 NULL — fresh inserts
+         the upstream pipeline hasn't backfilled yet → parse
+         SharePointPath, fill.  Bail-out on the first indexed COUNT
+         when nothing matches (near-zero cost in steady state).
+
+      B. (Once per process) Rows where the PERSISTED Folder01 does
+         NOT match what the current parser produces — catches parser
+         logic changes (e.g. "All Contracts" is now preserved instead
+         of collapsed) without requiring a one-shot migration script.
+         Runs a single O(N) scan on the first read after startup
+         then never again for the life of the process.
 
     Returns the number of rows updated (0 in the common no-work case)."""
-    n_before = _pending_folder_backfill_count(settings.CONTRACT_TABLE)
-    if n_before == 0:
-        return 0
-    _backfill_folder_columns_for(settings.CONTRACT_TABLE)
-    return n_before
+    global _stale_folder_check_done
+    table = settings.CONTRACT_TABLE
+
+    # Path A — rows with all folder columns NULL.  Cheap indexed count first.
+    null_updated = 0
+    if _pending_folder_backfill_count(table) > 0:
+        _backfill_folder_columns_for(table)
+        null_updated = -1     # exact count logged inside worker
+
+    # Path B — one-shot parser-drift reconciliation.
+    stale_updated = 0
+    if not _stale_folder_check_done:
+        try:
+            stale_updated = _rederive_stale_folder_rows(table)
+        finally:
+            _stale_folder_check_done = True
+
+    return (null_updated if null_updated > 0 else 0) + stale_updated
 
 
 def _pending_folder_backfill_count(table: str) -> int:
@@ -484,6 +533,68 @@ def _pending_folder_backfill_count(table: str) -> int:
         cur = cn.cursor()
         cur.execute(sql)
         return int(cur.fetchone()[0] or 0)
+
+
+def _rederive_stale_folder_rows(table: str) -> int:
+    """Re-derive Folder01..Folder20 for rows whose persisted Folder01
+    does not match what the current parser produces.
+
+    Only touches rows where the divergence is REAL (persisted first
+    segment != freshly-parsed first segment).  Rows where the parser
+    can't produce any segment (no SharePointPath, no derivable
+    folders) are left alone.
+
+    Cost: one SELECT of (FileID, SharePointPath, Folder01) — light
+    payload, indexed on FileID.  UPDATE only fires for the divergent
+    subset.  Steady state (parser stable, all rows aligned) → the
+    filter finds zero divergent rows and the UPDATE loop is skipped.
+
+    Returns the number of rows re-derived (0 when everything is
+    aligned)."""
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            f"SELECT [FileID], [SharePointPath], [Folder01] "
+            f"FROM dbo.[{table}] "
+            f"WHERE [SharePointPath] IS NOT NULL"
+        )
+        rows = cur.fetchall()
+
+        divergent: list[tuple] = []
+        for fid, path, persisted_f1 in rows:
+            fresh = folder_columns_from_path(path)
+            fresh_f1 = fresh[0] if fresh else None
+            # Compare the first segment — cheapest signal a parser
+            # change has occurred.  If they disagree, every other
+            # level almost certainly disagrees too (each level is
+            # shifted by one), so re-derive the whole 20-column
+            # tuple.  If both are None the row is trivially aligned.
+            if fresh_f1 != persisted_f1:
+                divergent.append((*fresh, str(fid)))
+
+        if not divergent:
+            return 0
+
+        set_clause = ", ".join(f"[{c}] = ?" for c in FOLDER_COLUMNS)
+        cn.autocommit = False
+        try:
+            cur.fast_executemany = True
+            cur.executemany(
+                f"UPDATE dbo.[{table}] SET {set_clause} WHERE [FileID] = ?",
+                divergent,
+            )
+            cn.commit()
+            logger.info(
+                "_rederive_stale_folder_rows: re-derived Folder01..20 on "
+                "%d row(s) in dbo.%s (parser-version drift)",
+                len(divergent), table,
+            )
+            return len(divergent)
+        except Exception:
+            cn.rollback()
+            raise
+        finally:
+            cn.autocommit = True
 
 
 def _backfill_folder_columns_for(table: str) -> None:
@@ -623,7 +734,168 @@ def _row_to_dict(row) -> dict:
     out["quoteID"]                = _s(r.get("QuoteID"))
     out["annualFeeIncrease"]      = _s(r.get("AnnualFeeIncrease"))
     out["feeIncreaseDate"]        = _s(r.get("FeeIncreaseDate"))
+    # Permanent per-file sequential number.  Assigned once and never
+    # renumbered — see _backfill_row_numbers_one_shot() +
+    # _assign_row_numbers_to_new_rows().  Null only during the brief
+    # window between an upstream INSERT and the next /api/contracts read
+    # (the read itself will assign a number before returning).
+    _rn = r.get("RowNumber")
+    out["rowNumber"]              = int(_rn) if isinstance(_rn, int) or (isinstance(_rn, str) and str(_rn).isdigit()) else None
     return out
+
+
+# ── Permanent per-file sequential number ("#") ────────────────────────────
+# The [RowNumber] column carries a stable, monotonically increasing integer
+# assigned exactly once per row and NEVER renumbered.  Two workers keep it
+# populated:
+#
+#   _backfill_row_numbers_one_shot()      — process startup, guarded by
+#                                            _row_number_backfill_done.
+#                                            Numbers every currently-NULL
+#                                            row in Id-ASC order starting
+#                                            from MAX(RowNumber)+1 (or 1
+#                                            on a brand-new column).
+#
+#   _assign_row_numbers_to_new_rows()     — every /api/contracts read.
+#                                            Cheap COUNT(*) WHERE
+#                                            RowNumber IS NULL first;
+#                                            on match, allocates the
+#                                            next N integers to those
+#                                            rows in a SERIALIZABLE tx
+#                                            so two concurrent readers
+#                                            can't hand out duplicates.
+#
+# Both are idempotent and fail-soft (any exception is logged and the
+# caller proceeds with whatever RowNumber values the row currently has
+# — Null renders as an empty cell in the UI, which is acceptable for
+# the brief window between an INSERT and the next read).
+_row_number_backfill_done = False
+
+
+def _backfill_row_numbers_one_shot() -> None:
+    """One-shot per process: number every row that has RowNumber IS NULL
+    in Id-ASC order, continuing from MAX(RowNumber) (or starting at 1
+    if the column was just added).
+
+    Uses ROW_NUMBER() in a single UPDATE ... FROM (SELECT ... FROM ... )
+    so the whole backfill is one round-trip regardless of row count.
+    """
+    global _row_number_backfill_done
+    if _row_number_backfill_done:
+        return
+    table = settings.CONTRACT_TABLE
+    try:
+        with get_connection() as cn:
+            cn.autocommit = False
+            cur = cn.cursor()
+            # Cheap gate — if nothing is NULL, mark done and bail.
+            cur.execute(
+                f"SELECT COUNT(*) FROM dbo.[{table}] WHERE [RowNumber] IS NULL"
+            )
+            pending = int(cur.fetchone()[0] or 0)
+            if pending == 0:
+                cn.rollback()
+                _row_number_backfill_done = True
+                return
+
+            # Continue from MAX; NULLs (from the new column) come out as 0
+            # via ISNULL so the first assigned value is 1 on a fresh column.
+            cur.execute(
+                f"SELECT ISNULL(MAX([RowNumber]), 0) FROM dbo.[{table}]"
+            )
+            base = int(cur.fetchone()[0] or 0)
+
+            # One UPDATE that assigns ROW_NUMBER() OVER (ORDER BY Id ASC)
+            # to every NULL row, offset by `base`.  Uses a CTE so SQL Server
+            # can update through the ranked source.
+            cur.execute(
+                f"WITH ranked AS ("
+                f"    SELECT [RowNumber], "
+                f"           ROW_NUMBER() OVER (ORDER BY [Id] ASC) AS rn "
+                f"    FROM dbo.[{table}] "
+                f"    WHERE [RowNumber] IS NULL"
+                f") "
+                f"UPDATE ranked SET [RowNumber] = rn + ?",
+                [base],
+            )
+            assigned = cur.rowcount
+            cn.commit()
+            logger.info(
+                "_backfill_row_numbers_one_shot: numbered %d row(s) in dbo.%s "
+                "(starting at %d)",
+                assigned, table, base + 1,
+            )
+        _row_number_backfill_done = True
+    except Exception as exc:
+        logger.warning(
+            "_backfill_row_numbers_one_shot: failed (will retry next call): %s",
+            exc,
+        )
+
+
+def _assign_row_numbers_to_new_rows() -> int:
+    """Per-read worker: hand out sequential numbers to any rows the
+    upstream ingest pipeline INSERTed since the last read.
+
+    Cost in steady state: one indexed COUNT(*) that returns 0 → return.
+    Only opens a transaction when there is real work to do.
+
+    Concurrency: uses SERIALIZABLE so two concurrent /api/contracts
+    reads can't both see the same NULL set and hand out overlapping
+    numbers.  The set of NULL rows is small (dozens at most between
+    reads), so the range-lock cost is negligible.
+
+    Returns the number of rows numbered (0 in the common no-work case).
+    """
+    table = settings.CONTRACT_TABLE
+    # Cheap gate — separate short connection so we don't hold locks on
+    # the common no-work path.
+    try:
+        with get_connection() as cn:
+            cur = cn.cursor()
+            cur.execute(
+                f"SELECT COUNT(*) FROM dbo.[{table}] WHERE [RowNumber] IS NULL"
+            )
+            if int(cur.fetchone()[0] or 0) == 0:
+                return 0
+    except Exception as exc:
+        logger.warning("_assign_row_numbers_to_new_rows: gate check failed: %s", exc)
+        return 0
+
+    try:
+        with get_connection() as cn:
+            cn.autocommit = False
+            cur = cn.cursor()
+            cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            cur.execute(
+                f"SELECT ISNULL(MAX([RowNumber]), 0) FROM dbo.[{table}]"
+            )
+            base = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"WITH ranked AS ("
+                f"    SELECT [RowNumber], "
+                f"           ROW_NUMBER() OVER (ORDER BY [Id] ASC) AS rn "
+                f"    FROM dbo.[{table}] "
+                f"    WHERE [RowNumber] IS NULL"
+                f") "
+                f"UPDATE ranked SET [RowNumber] = rn + ?",
+                [base],
+            )
+            assigned = cur.rowcount
+            cn.commit()
+            if assigned:
+                logger.info(
+                    "_assign_row_numbers_to_new_rows: numbered %d new row(s) "
+                    "in dbo.%s (starting at %d)",
+                    assigned, table, base + 1,
+                )
+            return int(assigned or 0)
+    except Exception as exc:
+        logger.warning(
+            "_assign_row_numbers_to_new_rows: failed (proceeding without): %s",
+            exc,
+        )
+        return 0
 
 
 # ── Reads ──────────────────────────────────────────────────────────────────
@@ -664,6 +936,17 @@ def load_contracts(include_excluded: bool = False) -> List[dict]:
             )
     except Exception as exc:
         logger.warning("load_contracts: live folder-backfill failed (proceeding): %s", exc)
+
+    # Live RowNumber assignment for rows the ingest pipeline INSERTed
+    # after the last read.  Same fail-soft contract as the folder
+    # backfill above: any exception is logged and the read proceeds
+    # with whatever RowNumber values are currently persisted.  Also
+    # retries the one-shot backfill if it failed earlier (idempotent).
+    try:
+        _backfill_row_numbers_one_shot()
+        _assign_row_numbers_to_new_rows()
+    except Exception as exc:
+        logger.warning("load_contracts: row-number assignment failed (proceeding): %s", exc)
 
     cols = ", ".join(f"[{c}]" for c in _COLUMNS)
     # ExcludedDate/ExcludedBy are appended AFTER the fixed _COLUMNS list so

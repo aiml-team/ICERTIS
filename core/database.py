@@ -413,6 +413,54 @@ def ensure_migration_integration_columns() -> None:
     )
 
 
+# ── Sequential per-file row number ────────────────────────────────────────
+# Business requirement (2026-09-24): every file row needs a stable, permanent
+# sequential number ("#") starting at 1 that is assigned once and NEVER
+# renumbered, so users have a durable reference across sessions independent
+# of sort order, filtering, or exclusion state.
+#
+# Implementation:
+#   • Column `RowNumber INT NULL` added additively to dbo.[ContractTable].
+#   • Existing rows are backfilled once (see data_service._backfill_row_numbers_one_shot)
+#     using ROW_NUMBER() OVER (ORDER BY Id ASC) so ordering matches the
+#     physical insert order (Id is IDENTITY, monotonically increasing).
+#   • New rows inserted by the upstream ingest pipeline arrive with
+#     RowNumber = NULL; on every /api/contracts read we assign
+#     MAX(RowNumber) + 1, +2, ... to them in Id order inside a
+#     SERIALIZABLE tx so two concurrent readers can't hand out
+#     duplicate numbers.
+#   • The column is NOT the primary key and has no unique constraint
+#     (kept nullable to keep INSERTs from the ingest pipeline zero-friction).
+_ADD_ROW_NUMBER_COLUMN_DDL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE Name = N'RowNumber' AND Object_ID = Object_ID(N'dbo.[{table}]')
+)
+BEGIN
+    ALTER TABLE dbo.[{table}] ADD [RowNumber] INT NULL;
+END;
+"""
+
+
+def ensure_row_number_column() -> None:
+    """Idempotent: add [RowNumber] INT NULL to the master inventory.
+
+    Backfill of the actual sequential values is handled separately by
+    `services.data_service._backfill_row_numbers_one_shot()` on the first
+    schema-check pass — this function only guarantees the column exists.
+    """
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            _ADD_ROW_NUMBER_COLUMN_DDL.format(table=settings.CONTRACT_TABLE)
+        )
+        cn.commit()
+    logger.info(
+        "ensure_row_number_column: [RowNumber] verified on dbo.%s",
+        settings.CONTRACT_TABLE,
+    )
+
+
 def ensure_migration_status_column() -> None:
     """Idempotent: adds the MigrationStatus column to both active and
     excluded tables if they pre-date the feature.  Backfills existing

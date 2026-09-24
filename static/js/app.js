@@ -1,6 +1,12 @@
 /* ── Column definitions ─────────────────────────────────────────────────── */
 // Every column carries an optional `group` tag used ONLY by the Columns
 // picker to render section headings.  Untagged columns fall under "General".
+// NOTE: the permanent per-file "#" (row.rowNumber, persisted server-side
+// in dbo.[ContractInventory1].[RowNumber]) is rendered by the frozen
+// leading "#" column (see renderTable() below) — it is NOT a COL_CFG entry
+// because the frozen column already renders it independently of the
+// picker / hide-all / column-filter logic and adding it here would
+// double-render the value.
 const COL_CFG = [
   { f: 'fileName',               h: 'File Name',           ft: 'text', w: 320 },
   { f: 'customerName',           h: 'Customer Name',       ft: 'text', w: 170 },
@@ -86,8 +92,11 @@ const SEARCHABLE = ['fileName','customerName','agreementName','opportunityID','a
 const state = {
   allData:          [],
   filteredData:     [],
-  sortCol:          null,
-  sortDir:          null,
+  // Default sort: permanent RowNumber ascending, so rows display as 1,2,3,...
+  // on initial load and after every refresh.  User can click any column
+  // header to override.
+  sortCol:          'rowNumber',
+  sortDir:          'asc',
   columnFilters:    {},
   globalSearch:     '',
   hiddenCols:       new Set(COL_CFG.filter(c => c.hide).map(c => c.f)),
@@ -385,6 +394,13 @@ const FOLDER_ROOT_LABEL = 'All Contracts';
 // Matched case-insensitively.  If the raw path contains them we skip them
 // while walking segments so the browser starts at the real business root.
 const _TECHNICAL_SEG_RE = /^(shared\s*documents|documents|forms|allitems\.aspx?)$/i;
+// Document-library name that lives at the site root.  Same word can
+// appear as a real folder deeper in the tree (e.g.
+//   /sites/US-Contracts_Management/Contracts/All Contracts/Contracts/Client/…
+// ).  Stripped ONLY when it is the FIRST segment after /sites/<site>/
+// so the inner folder of the same name is preserved.  Must match the
+// server-side parser (services/data_service.py::_LIBRARY_NAME_LEADING).
+const _LIBRARY_NAME_LEADING = 'Contracts';
 
 function _folderSegmentsFor(row) {
   const raw = row && row.sharePointPath;
@@ -401,6 +417,12 @@ function _folderSegmentsFor(row) {
     // Drop leading /sites/<site-name>/ pair when present.
     if (parts[0] && parts[0].toLowerCase() === 'sites' && parts.length >= 2) {
       parts.splice(0, 2);
+    }
+    // Strip the SharePoint document-library name when it's the FIRST
+    // segment.  Preserves an identically-named real folder deeper in
+    // the path (see _LIBRARY_NAME_LEADING comment above).
+    if (parts[0] && parts[0].toLowerCase() === _LIBRARY_NAME_LEADING.toLowerCase()) {
+      parts.shift();
     }
     segs = parts;
   } else {
@@ -420,9 +442,10 @@ function _folderSegmentsFor(row) {
   const last = decoded[decoded.length - 1];
   if (/\.[A-Za-z0-9]{1,6}$/.test(last)) decoded.pop();
 
-  // Collapse a literal "All Contracts" segment anywhere in the chain —
-  // we render the virtual root separately so nesting it would duplicate.
-  return decoded.filter(seg => seg.toLowerCase() !== FOLDER_ROOT_LABEL.toLowerCase());
+  // "All Contracts" is a REAL folder level in the SharePoint hierarchy
+  // (business asked to see every path segment as-is).  Kept in the list
+  // verbatim — must match the server-side folder_segments_for parser.
+  return decoded;
 }
 
 function _makeFolderNode(name) {
@@ -571,15 +594,30 @@ function applyFiltersAndSort() {
   }
   if (state.sortCol) {
     const col = COL_CFG.find(c => c.f === state.sortCol);
-    const ft = col ? col.ft : 'text';
+    // 'rowNumber' is the permanent server-assigned "#" and lives outside
+    // COL_CFG (rendered by the frozen leading column, not a picker entry).
+    // Treat it as numeric so 2 < 10, and put NULLs (transient window
+    // between INSERT and next read) at the bottom regardless of direction.
+    const isRowNumber = state.sortCol === 'rowNumber';
+    const ft = col ? col.ft : (isRowNumber ? 'number' : 'text');
     d = [...d].sort((a, b) => {
-      const va = cellStr(a, state.sortCol);
-      const vb = cellStr(b, state.sortCol);
       let cmp = 0;
-      if (ft === 'date') {
+      if (ft === 'number') {
+        const na = a[state.sortCol], nb = b[state.sortCol];
+        // NULL / undefined always sinks to the end so users never see a
+        // blank cell at the top of a fresh sort.
+        if (na == null && nb == null) return 0;
+        if (na == null) return 1;
+        if (nb == null) return -1;
+        cmp = na - nb;
+      } else if (ft === 'date') {
+        const va = cellStr(a, state.sortCol);
+        const vb = cellStr(b, state.sortCol);
         const da = parseDate(va), db = parseDate(vb);
         cmp = (da || 0) > (db || 0) ? 1 : (da || 0) < (db || 0) ? -1 : 0;
       } else {
+        const va = cellStr(a, state.sortCol);
+        const vb = cellStr(b, state.sortCol);
         cmp = va.localeCompare(vb, undefined, { sensitivity: 'base', numeric: true });
       }
       return state.sortDir === 'desc' ? -cmp : cmp;
@@ -802,14 +840,21 @@ function renderTable() {
   const pageData = state.filteredData.slice(start, start + state.pageSize);
 
   let thead = '<thead><tr>';
-  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn" style="width:40px;min-width:40px;max-width:40px">#</th>`;
+  // Frozen "Row No." header — permanent server-assigned per-file number
+  // (dbo.[ContractInventory1].[RowNumber]).  Clickable to toggle asc/desc
+  // sort by rowNumber (handled in attachTableEvents()).  Widened to fit
+  // the longer label plus the sort caret.
+  const rnSortIcon = state.sortCol === 'rowNumber'
+    ? (state.sortDir === 'asc' ? ' <span class="th-sort-icon">&#9650;</span>' : ' <span class="th-sort-icon">&#9660;</span>')
+    : '';
+  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn th-sortable" id="th-rownumber" style="width:80px;min-width:80px;max-width:80px;cursor:pointer;" title="Click to sort by Row No.">Row No.${rnSortIcon}</th>`;
   thead += `<th class="col-cb col-frozen col-frozen-1 th-cb-hdr" style="width:44px;min-width:44px;max-width:44px;" title="Select all visible rows"><input type="checkbox" id="hdr-check"></th>`;
 
   visibleCols.forEach((col, idx) => {
     const w = state.colWidths[col.f] || col.w;
     const isFirst = idx === 0;
     const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
-    const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:15;background:#eaeff5;' : '';
+    const frozenStyle = isFirst ? 'position:sticky;left:124px;z-index:15;background:#eaeff5;' : '';
     // Virtual columns (e.g. "Matched Folder") get a stripped-down header:
     // no filter button, no resize handle, no sort click — they are not
     // backed by a real data field.
@@ -873,7 +918,13 @@ function renderTable() {
                       + (lockedForSelection ? ' data-locked="1"' : '');
 
       tbody += `<tr class="${rowClasses}" data-id="${esc(row.fileID)}"${dataFlags}>`;
-      tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:40px;min-width:40px;max-width:40px">${globalIdx + 1}</td>`;
+      // Frozen "#" column shows the PERMANENT server-assigned row number
+      // (persisted in dbo.[ContractInventory1].[RowNumber]) so the identifier
+      // is stable across sort / filter / pagination / session.  Falls back
+      // to the page-relative index only if the server value hasn't been
+      // assigned yet (transient window between INSERT and next read).
+      const rnDisplay = (row.rowNumber != null) ? row.rowNumber : (globalIdx + 1);
+      tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:80px;min-width:80px;max-width:80px" title="Row #${rnDisplay}">${rnDisplay}</td>`;
       tbody += `<td class="col-cb col-frozen col-frozen-1 cell-cb" style="width:44px;min-width:44px;max-width:44px"${cbTitle ? ` title="${cbTitle}"` : ''}><input type="checkbox" class="row-check" data-id="${esc(row.fileID)}" ${isSelected ? 'checked' : ''} ${cbDisabled}></td>`;
 
       visibleCols.forEach((col, idx) => {
@@ -884,7 +935,7 @@ function renderTable() {
         // properly occlude horizontally-scrolled cells behind them. Setting
         // `background: inherit` inline used to resolve to transparent and
         // caused the visible "row overlap" when the table was scrolled right.
-        const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;' : '';
+        const frozenStyle = isFirst ? 'position:sticky;left:124px;z-index:10;' : '';
         const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
         tbody += `<td class="${frozen}" style="${frozenStyle}width:${w}px;min-width:${w}px;max-width:${w}px;overflow:hidden;">${renderCell(row, col)}</td>`;
       });
@@ -941,6 +992,24 @@ function getEligiblePageIds() {
 }
 
 function attachTableEvents() {
+  // Frozen "Row No." header — click to toggle asc/desc sort on the
+  // permanent server-assigned RowNumber.  Not a normal column-filter
+  // panel (no text/date filter needed for a monotonic integer) so we
+  // wire the click directly here instead of the .th-filter-btn path.
+  const rnHdr = document.getElementById('th-rownumber');
+  if (rnHdr) {
+    rnHdr.addEventListener('click', () => {
+      if (state.sortCol === 'rowNumber') {
+        state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.sortCol = 'rowNumber';
+        state.sortDir = 'asc';
+      }
+      applyFiltersAndSort();
+      renderAll();
+    });
+  }
+
   const hdrCheck = document.getElementById('hdr-check');
   if (hdrCheck) {
     hdrCheck.addEventListener('change', () => {
@@ -2074,6 +2143,14 @@ function openColPanel() {
     groups.get(g).push(c);
   }
 
+  // Columns that must always remain visible regardless of "Hide all".
+  // File Name is the only anchor a user has to identify a row; hiding
+  // it would leave an unusable table.  Migrate / MigratedDate are
+  // already force-restored on page load (see hiddenCols init above)
+  // and included here so the bulk action stays consistent with that
+  // invariant instead of showing them briefly-hidden between clicks.
+  const MANDATORY_FIELDS = new Set(['fileName', 'migrate', 'migratedDate']);
+
   const renderGroup = (title, cols) => {
     if (!cols.length) return '';
     const rows = cols.map(c => `
@@ -2081,16 +2158,14 @@ function openColPanel() {
           <input type="checkbox" class="col-toggle" data-field="${c.f}" ${!state.hiddenCols.has(c.f)?'checked':''}>
           ${esc(c.h)}
         </label>`).join('');
-    // Each group also gets a compact "Show all / hide all" affordance so
-    // toggling Folder 5..20 en masse doesn't require 16 clicks.
+    // Section headings stay untouched — only the group-level Show/Hide
+    // buttons were removed per manager request 2026-09-24.  There is
+    // now ONE global Show all / Hide all pair at the top of the panel
+    // that acts across every group at once.
     return `
       <div class="colpanel-group">
         <div class="colpanel-group-head">
           <span>${esc(title)}</span>
-          <span class="colpanel-group-actions">
-            <button type="button" class="colpanel-group-btn" data-group="${esc(title)}" data-action="show">Show all</button>
-            <button type="button" class="colpanel-group-btn" data-group="${esc(title)}" data-action="hide">Hide all</button>
-          </span>
         </div>
         ${rows}
       </div>`;
@@ -2099,7 +2174,13 @@ function openColPanel() {
   const html = `
     <div class="colpanel-backdrop" id="colpanel-backdrop"></div>
     <div class="colpanel" id="colpanel">
-      <div class="colpanel-head">Columns</div>
+      <div class="colpanel-head">
+        <span>Columns</span>
+        <span class="colpanel-global-actions">
+          <button type="button" class="colpanel-global-btn" data-action="show">Show all</button>
+          <button type="button" class="colpanel-global-btn" data-action="hide">Hide all</button>
+        </span>
+      </div>
       ${[...groups.entries()].map(([g, cols]) => renderGroup(g, cols)).join('')}
     </div>`;
 
@@ -2119,16 +2200,22 @@ function openColPanel() {
     });
   });
 
-  // Group-level bulk toggles — keep group headers responsive.
-  mount.querySelectorAll('.colpanel-group-btn').forEach(btn => {
+  // Global bulk toggles — one Show all / one Hide all at the top of
+  // the panel act across every section at once.  "Hide all" respects
+  // MANDATORY_FIELDS so File Name / Migrate / Migrated Date remain
+  // visible (otherwise the table would become unidentifiable and
+  // hiddenCols init would immediately restore them anyway).
+  mount.querySelectorAll('.colpanel-global-btn').forEach(btn => {
     btn.addEventListener('click', (ev) => {
       ev.preventDefault();
-      const g = btn.dataset.group;
       const action = btn.dataset.action;                // 'show' | 'hide'
-      const cols = groups.get(g) || [];
-      for (const c of cols) {
-        if (action === 'show') state.hiddenCols.delete(c.f);
-        else                   state.hiddenCols.add(c.f);
+      for (const c of COL_CFG) {
+        if (action === 'show') {
+          state.hiddenCols.delete(c.f);
+        } else {
+          if (MANDATORY_FIELDS.has(c.f)) continue;      // keep visible
+          state.hiddenCols.add(c.f);
+        }
       }
       localStorage.setItem('cmr-hidden', JSON.stringify([...state.hiddenCols]));
       // Reflect the new checked state without tearing down the panel.
@@ -2952,16 +3039,18 @@ const migrationPoller = (function () {
 
   let timer   = null;    // setInterval handle; non-null iff running
   let inFlight = false;  // true while a tick's fetches are in flight
-  // Promise handle for the currently-running tick.  When a caller
-  // (auto-interval OR manual Refresh click) arrives while another
-  // tick is already in flight, we hand back THIS promise instead of
-  // dropping the call silently.  That way `await tick()` from
-  // migrationPoller.refreshNow() actually waits for the real refresh
-  // to finish — otherwise the Refresh button's disabled/"Refreshing…"
-  // state flashes on/off in <100 ms and the user thinks the click
-  // was ignored (visible bug: first click of the button appears
-  // dead, only subsequent clicks that happen to land BETWEEN two
-  // auto-ticks actually work).
+  // Kind of work currently in flight:
+  //   'buckets' — cheap sync + KPI repaint only (auto tick).
+  //   'full'    — sync + row fetch + full table re-render (manual click).
+  // Used by the overlap guard so a manual full-refresh request that
+  // lands mid-auto-tick DOES NOT get silently downgraded to just
+  // awaiting the buckets-only promise (that was the "click Refresh,
+  // rows never appear" bug the user reported 2026-09-24).
+  let inFlightKind = null;   // 'buckets' | 'full' | null
+  // Promise handle for the currently-running tick.  Only reused when
+  // the incoming request wants the SAME (or weaker) work than what's
+  // already running — see tick() below for the "wait for buckets to
+  // finish, THEN run full" upgrade path.
   let inFlightPromise = null;
   let consecutiveErrors = 0;
   let hasWarnedThisFailureBurst = false;
@@ -2991,15 +3080,112 @@ const migrationPoller = (function () {
     }
   }
 
-  function tick() {
-    // Overlap guard — spec requirement.  A slow /api/contracts or
-    // /api/migrations/sync must never cause two concurrent refresh
-    // pipelines to run.  If a tick is already running we return the
-    // SAME promise the first caller is waiting on, so a manual
-    // Refresh click that lands mid-auto-tick awaits the real work
-    // rather than resolving instantly with `undefined` (which used
-    // to make the button appear unresponsive on the first click).
+  /** Apply a fresh count-buckets payload (from /api/migrations/sync or
+   *  /api/contracts) to state.populationCounts.  Extracted so both the
+   *  buckets-only auto tick and the full manual tick can share it. */
+  function _applyCountsFromResponse(res) {
+    if (!res || !res.counts || typeof res.counts !== 'object') return;
+    state.populationCounts = {
+      ...state.populationCounts,
+      active:        Number(res.counts.active)        || state.populationCounts.active,
+      excluded:      Number(res.counts.excluded)      || state.populationCounts.excluded,
+      total:         Number(res.counts.total)         || state.populationCounts.total,
+      pending:       Number(res.counts.pending)       || 0,
+      in_processing: Number(res.counts.in_processing) || 0,
+      migrated:      Number(res.counts.migrated)      || 0,
+      failed:        Number(res.counts.failed)        || 0,
+      // Per-user workload-lock fields — trust the server.  This is
+      // what auto-unlocks the Migrate button as the current user's
+      // rows complete (my_in_processing → 0 → can_migrate = true).
+      my_in_processing: Number(res.counts.my_in_processing) || 0,
+      my_active_total:  Number(res.counts.my_active_total)  || 0,
+      can_migrate:      (res.counts.can_migrate !== false),
+    };
+  }
+
+  /** Buckets-only refresh — the AUTO-refresh path.
+   *
+   *  Rationale (per manager request 2026-09-24): the previous auto tick
+   *  re-fetched every row and re-rendered the entire table on every 5 s
+   *  interval.  When the user was scrolled far to the right, the DOM
+   *  swap caused a visible "glitch" (scroll jump / column flicker /
+   *  hover state loss).  Splitting the paths keeps the KPI buckets
+   *  live (Yet-to-be-Migrated, In Processing, Migrated, Failed,
+   *  Excluded counts update every 5 s) while leaving the table DOM,
+   *  scroll offsets, selection, filters, sort, and pagination
+   *  completely untouched.
+   *
+   *  If the user wants the row list refreshed (e.g. to see new rows
+   *  the ingest pipeline just added) they click the manual "Refresh"
+   *  toolbar button, which still calls the full `tick()` below. */
+  function _tickBucketsOnly() {
+    // If ANY tick is already in flight (buckets or full), joining it is
+    // safe — a full tick also refreshes buckets as part of its work,
+    // so the caller gets fresh counts either way.
     if (inFlight && inFlightPromise) return inFlightPromise;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return Promise.resolve();
+    }
+    inFlight = true;
+    inFlightKind = 'buckets';
+    inFlightPromise = (async () => {
+      try {
+        // Cheap payload — asks the server to reconcile with the platform
+        // and returns fresh bucket counts.  No row data is fetched, no
+        // table DOM is touched.
+        const res = await migrationService.sync();
+        consecutiveErrors = 0;
+        hasWarnedThisFailureBurst = false;
+        _applyCountsFromResponse(res);
+        // Repaint ONLY the KPI bucket bar.  updateBuckets() is a cheap
+        // targeted DOM update (text swaps + one class toggle) — it does
+        // NOT re-render the table, so scroll offsets, hover state, and
+        // column layout are preserved intact.
+        try { updateBuckets(); } catch (_) {}
+        // Progress badge (top-right) is bucket-derived too — safe to
+        // refresh here without touching the table.
+        try { migProgress.tick(); } catch (_) {}
+      } catch (err) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS && !hasWarnedThisFailureBurst) {
+          hasWarnedThisFailureBurst = true;
+          try { showToast('Auto-refresh temporarily unavailable — retrying in background.'); } catch (_) {}
+        }
+        try { console.warn('[migrationPoller] buckets tick failed:', err && err.message || err); } catch (_) {}
+      } finally {
+        inFlight = false;
+        inFlightKind = null;
+        inFlightPromise = null;
+      }
+    })();
+    return inFlightPromise;
+  }
+
+  /** Full refresh — the MANUAL Refresh button path.
+   *
+   *  Does everything the auto path did previously: sync, re-fetch every
+   *  row, re-apply filters/sort, re-render the table.  Scroll offsets
+   *  are snapshotted/restored so a manual refresh doesn't bump the user
+   *  back to the top of a horizontally-scrolled view. */
+  function tick() {
+    // Overlap guard — must be type-aware:
+    //   • Another FULL tick already running → return its promise (real
+    //     duplicate, no need to run twice).
+    //   • A BUCKETS-ONLY tick is running → the caller (manual Refresh
+    //     button) wants the TABLE refreshed too, which buckets-only
+    //     does NOT do.  Downgrading to await the buckets promise was
+    //     the bug the user reported ("click Refresh, rows never
+    //     appear").  Instead: wait for the buckets tick to finish
+    //     (avoids two concurrent /api/migrations/sync calls) and
+    //     THEN launch the full tick from a clean state.
+    if (inFlight && inFlightPromise) {
+      if (inFlightKind === 'full') return inFlightPromise;
+      // Chained upgrade: buckets → full.  Return a new promise that
+      // awaits the in-flight buckets tick and then re-invokes tick()
+      // to do the full work.
+      const bucketsPromise = inFlightPromise;
+      return bucketsPromise.then(() => tick());
+    }
 
     // Skip while the tab is hidden to save CPU + network for background
     // pages.  visibilitychange handler forces an immediate tick when
@@ -3010,6 +3196,7 @@ const migrationPoller = (function () {
     }
 
     inFlight = true;
+    inFlightKind = 'full';
     const scrollSnap = _snapshotScroll();
     inFlightPromise = (async () => {
     try {
@@ -3019,25 +3206,7 @@ const migrationPoller = (function () {
       const res = await migrationService.sync();
       consecutiveErrors = 0;
       hasWarnedThisFailureBurst = false;
-
-      if (res.counts && typeof res.counts === 'object') {
-        state.populationCounts = {
-          ...state.populationCounts,
-          active:        Number(res.counts.active)        || state.populationCounts.active,
-          excluded:      Number(res.counts.excluded)      || state.populationCounts.excluded,
-          total:         Number(res.counts.total)         || state.populationCounts.total,
-          pending:       Number(res.counts.pending)       || 0,
-          in_processing: Number(res.counts.in_processing) || 0,
-          migrated:      Number(res.counts.migrated)      || 0,
-          failed:        Number(res.counts.failed)        || 0,
-          // Per-user workload-lock fields — trust the server.  This is
-          // what auto-unlocks the Migrate button as the current user's
-          // rows complete (my_in_processing → 0 → can_migrate = true).
-          my_in_processing: Number(res.counts.my_in_processing) || 0,
-          my_active_total:  Number(res.counts.my_active_total)  || 0,
-          can_migrate:      (res.counts.can_migrate !== false),
-        };
-      }
+      _applyCountsFromResponse(res);
 
       // ── 2. Row refresh ─────────────────────────────────────────────
       // Always pull fresh rows so the current table reflects DB state
@@ -3071,6 +3240,7 @@ const migrationPoller = (function () {
       try { console.warn('[migrationPoller] tick failed:', err && err.message || err); } catch (_) {}
     } finally {
       inFlight = false;
+      inFlightKind = null;
       // Clear the shared promise handle so the NEXT caller starts a
       // fresh tick instead of awaiting an already-settled one.
       inFlightPromise = null;
@@ -3083,8 +3253,10 @@ const migrationPoller = (function () {
     if (visibilityHandlerAttached || typeof document === 'undefined') return;
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && timer) {
-        // Immediate catch-up on tab focus; the interval keeps ticking.
-        tick();
+        // Immediate catch-up on tab focus — buckets only (matches the
+        // rest of the auto-refresh cadence).  Users see fresh bucket
+        // counts on tab focus without the table DOM churning.
+        _tickBucketsOnly();
       }
     });
     visibilityHandlerAttached = true;
@@ -3093,12 +3265,22 @@ const migrationPoller = (function () {
   function start() {
     if (timer) return;                  // idempotent — single-timer guarantee
     _attachVisibilityHandler();
-    // Fire once immediately so the user sees fresh data without waiting.
-    tick();
+    // Fire ONE buckets-only tick immediately so the KPI bar shows the
+    // freshest counts without waiting for the first interval.  The
+    // initial full row payload has already been loaded by the Start
+    // button (see enterReviewScreen), so we don't need a full tick
+    // here — that would just re-render the table the user is looking
+    // at and cause the same scroll-jump glitch this feature is meant
+    // to eliminate.
+    _tickBucketsOnly();
     const intervalMs = (state && Number.isFinite(state.pollIntervalMs) && state.pollIntervalMs >= 2000)
                         ? state.pollIntervalMs
                         : 5000;
-    timer = setInterval(tick, intervalMs);
+    // Auto-interval uses the buckets-only path — the table DOM is
+    // never re-rendered by the poller.  Users refresh the table
+    // manually via the Refresh toolbar button (which calls
+    // refreshNow() → the full tick() below).
+    timer = setInterval(_tickBucketsOnly, intervalMs);
   }
 
   function stop() {
@@ -3448,13 +3630,16 @@ function renderExcludedTable() {
   if (empty) empty.style.display = 'none';
 
   let thead = '<thead><tr>';
-  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn" style="width:40px;min-width:40px;max-width:40px">#</th>`;
+  // Frozen "Row No." header — same permanent RowNumber used in the main
+  // view.  Not sortable in the excluded view (rows are already ordered
+  // by ExcludedDate DESC per the load_excluded() server contract).
+  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn" style="width:80px;min-width:80px;max-width:80px" title="Row No.">Row No.</th>`;
   thead += `<th class="col-cb col-frozen col-frozen-1 th-cb-hdr" style="width:44px;min-width:44px;max-width:44px;" title="Select all rows"><input type="checkbox" id="excluded-hdr-check"></th>`;
 
   EXCLUDED_COLS.forEach((col, idx) => {
     const isFirst = idx === 0;
     const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
-    const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:15;background:#eaeff5;' : '';
+    const frozenStyle = isFirst ? 'position:sticky;left:124px;z-index:15;background:#eaeff5;' : '';
     thead += `<th class="${frozen}" style="${frozenStyle}width:${col.w}px;min-width:${col.w}px;max-width:${col.w}px">
       <div class="th-inner"><span class="th-label">${esc(col.h)}</span></div>
     </th>`;
@@ -3466,7 +3651,10 @@ function renderExcludedTable() {
     const isSelected = state.excludedSelectedIds.has(row.fileID);
     const classes = isSelected ? 'row-selected' : '';
     tbody += `<tr class="${classes}" data-id="${esc(row.fileID)}">`;
-    tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:40px;min-width:40px;max-width:40px">${i + 1}</td>`;
+    // See main table above — same permanent RowNumber, falls back to
+    // page-relative index only when the server value is not yet assigned.
+    const rnDisplay = (row.rowNumber != null) ? row.rowNumber : (i + 1);
+    tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:80px;min-width:80px;max-width:80px" title="Row #${rnDisplay}">${rnDisplay}</td>`;
     tbody += `<td class="col-cb col-frozen col-frozen-1 cell-cb" style="width:44px;min-width:44px;max-width:44px"><input type="checkbox" class="excluded-row-check" data-id="${esc(row.fileID)}" ${isSelected ? 'checked' : ''}></td>`;
 
     EXCLUDED_COLS.forEach((col, idx) => {
@@ -3474,7 +3662,7 @@ function renderExcludedTable() {
       // See note in renderTable() — no inline background; .col-frozen CSS
       // supplies opaque per-state background-color so sticky cells occlude
       // scrolled content instead of letting it bleed through.
-      const frozenStyle = isFirst ? 'position:sticky;left:84px;z-index:10;' : '';
+      const frozenStyle = isFirst ? 'position:sticky;left:124px;z-index:10;' : '';
       const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
       // Reuse renderCell for consistency — it handles SharePoint links, dates,
       // status badges, etc. For fields not in COL_CFG (excludedDate) fall back
@@ -3806,8 +3994,10 @@ function enterReviewScreen() {
 
   state.columnFilters = {};
   state.globalSearch  = '';
-  state.sortCol       = null;
-  state.sortDir       = null;
+  // Default sort: RowNumber ascending — matches the initial state so
+  // enterReviewScreen() presents rows in 1,2,3,... order.
+  state.sortCol       = 'rowNumber';
+  state.sortDir       = 'asc';
   state.selectedIds.clear();
   state.bucketFilter  = 'all';
   state.folderPath    = [];
@@ -4081,8 +4271,11 @@ function initReviewEventListeners() {
     state.columnFilters = {};
     state.globalSearch = '';
     $('search-input').value = '';
-    state.sortCol = null;
-    state.sortDir = null;
+    // Clear Filters restores the default sort (RowNumber ascending) so
+    // the table returns to the same 1,2,3,... ordering the user saw on
+    // first load, not to an unsorted "as-fetched" order.
+    state.sortCol = 'rowNumber';
+    state.sortDir = 'asc';
     state.bucketFilter = 'all';
     state.folderPath = [];                 // reset folder scope to All Contracts
     // Also drop the global folder filter (§15 spec — Clear Filters must

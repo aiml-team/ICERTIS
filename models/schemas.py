@@ -43,6 +43,10 @@ class ContractRecord(BaseModel):
     quoteID: Optional[str] = None
     annualFeeIncrease: Optional[str] = None
     feeIncreaseDate: Optional[str] = None
+    # Permanent per-file sequential number ("#" column).  Assigned once
+    # and never renumbered.  Null only during the brief window between
+    # an ingest INSERT and the next /api/contracts read.
+    rowNumber: Optional[int] = None
 
 
 class ContractsResponse(BaseModel):
