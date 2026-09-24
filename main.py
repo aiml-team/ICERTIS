@@ -20,6 +20,26 @@ logging.basicConfig(
 
 BASE_DIR = Path(__file__).parent
 
+
+def _compute_asset_version() -> str:
+    """Return a short version string derived from the mtime of static/js/app.js.
+
+    Used as a `?v=<version>` cache-buster on the <script>/<link> tags in
+    index.html so browsers always fetch the freshest bundle after a deploy
+    or dev-time edit (previously users had to hard-refresh to pick up
+    schema/UI changes).  Falls back to the process pid + start epoch when
+    the file can't be stat'd — still monotonic-ish across restarts.
+    """
+    try:
+        import os as _os
+        return str(int(_os.path.getmtime(BASE_DIR / "static" / "js" / "app.js")))
+    except Exception:
+        import os as _os, time as _time
+        return f"{_os.getpid()}-{int(_time.time())}"
+
+
+ASSET_VERSION = _compute_asset_version()
+
 app = FastAPI(
     title="Contract Migration Review",
     docs_url="/api/docs",
@@ -57,7 +77,7 @@ async def login_page(request: Request):
     # newer Starlette releases; the old (name, context) form still works via
     # kwargs on 0.38.x but is deprecated and breaks on some Azure images.
     return templates.TemplateResponse(
-        request=request, name="login.html", context={}
+        request=request, name="login.html", context={"asset_version": ASSET_VERSION}
     )
 
 
@@ -70,7 +90,7 @@ async def index(request: Request):
         return RedirectResponse(url="/login", status_code=302)
     # Same keyword-based signature — see /login handler above.
     return templates.TemplateResponse(
-        request=request, name="index.html", context={}
+        request=request, name="index.html", context={"asset_version": ASSET_VERSION}
     )
 
 

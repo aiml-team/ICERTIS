@@ -217,7 +217,10 @@ def _migrate_legacy_excluded_table_back() -> None:
                 [f"dbo.[{ex}]"],
             )
             legacy_cols = {str(r[0]) for r in cur.fetchall()}
-            shared_cols = [c for c in _COLUMNS if c in legacy_cols]
+            # Never copy the master IDENTITY PK (`Id`) — SQL Server would
+            # reject explicit inserts into it without SET IDENTITY_INSERT.
+            # The new master row gets a fresh Id assigned on INSERT.
+            shared_cols = [c for c in _COLUMNS if c in legacy_cols and c != "Id"]
             copy_cols_sql = ", ".join(f"[{c}]" for c in shared_cols)
             cur.execute(
                 f"INSERT INTO dbo.[{active}] "
@@ -260,7 +263,11 @@ def _migrate_legacy_excluded_table_back() -> None:
 
 
 # Column order used in SELECT / INSERT below. Kept in one place so seed + read
-# stay in sync.
+# stay in sync.  Matches the physical schema of dbo.ContractInventory1
+# (see results (4).xlsx) — new fields (Id, FolderName, FolderType, BatchID,
+# BatchNumber, PageCount, TextCharacters, EndCustomerName, QuoteID,
+# AnnualFeeIncrease, FeeIncreaseDate) are appended so downstream index-based
+# access stays stable.
 _BASE_COLUMNS = [
     "FileID", "FileName", "SharePointPath", "LastModified", "ModifiedBy",
     "ItemType", "OpportunityID", "AE", "LegalEntity", "CustomerName",
@@ -270,6 +277,10 @@ _BASE_COLUMNS = [
     "VoidExclusionIndicator", "ExtractionStatus", "ReviewRequired",
     "MissingFields", "ProcessedDate", "ErrorMessage", "RunId",
     "Migrate", "Migrated", "MigratedDate", "MigrationStatus",
+    # ── New schema fields (added in ContractInventory1) ─────────────────
+    "Id", "FolderName", "FolderType", "BatchID", "BatchNumber",
+    "PageCount", "TextCharacters",
+    "EndCustomerName", "QuoteID", "AnnualFeeIncrease", "FeeIncreaseDate",
 ]
 
 # Folder1..Folder20 columns — appended AFTER the base columns so index-based
@@ -297,14 +308,33 @@ _COLUMNS = _BASE_COLUMNS + FOLDER_COLUMNS + MIGRATION_INTEGRATION_COLUMNS
 
 
 def _s(v) -> str | None:
-    """Trim + treat empty as None."""
+    """Trim + treat empty as None.
+
+    Handles Python `date`/`datetime` values (returned by pyodbc for the
+    new-schema DATE / DATETIME columns) by rendering them in the format
+    the frontend `parseDate()` helper already understands.
+    """
     if v is None:
         return None
+    # Import locally so this stays a hot-path free of module-level cost.
+    import datetime as _dt
+    if isinstance(v, _dt.datetime):
+        return _fmt_dt(v)
+    if isinstance(v, _dt.date):
+        # ISO-ish M/D/YYYY (matches the client date parser expectations).
+        return f"{v.month}/{v.day}/{v.year}"
     s = str(v).strip()
     return s if s else None
 
 
 def _parse_bool_str(v) -> bool | None:
+    # pyodbc may return a real Python bool for BIT columns (new schema:
+    # ReviewRequired is BIT).  Preserve legacy NVARCHAR handling for
+    # backwards compatibility with any string-typed source (CSV seed).
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return bool(v)
     s = _s(v)
     if s is None:
         return None
@@ -401,8 +431,17 @@ def folder_columns_from_path(sharepoint_path: str | None) -> list[str | None]:
 
 def backfill_folder_columns() -> None:
     """Populate Folder1..Folder20 from SharePointPath for every row that
-    still has all folder columns NULL.  Runs once per process (guarded by
-    _schema_ready) so it's cheap after the first startup.
+    still has all folder columns NULL.
+
+    Called from two places:
+      1. `_ensure_schema_once()` — once per process on the first DB access,
+         so a fresh startup on an un-backfilled database catches up.
+      2. `load_contracts()` — on EVERY read, via `backfill_folder_columns_if_needed()`.
+         Cost is a single indexed SELECT (rows-that-need-work) — a no-op
+         return when nothing matches.  Guarantees that rows inserted by
+         the upstream pipeline WHILE the app is running have their folder
+         columns filled in by the very next UI refresh, instead of having
+         to wait for a server restart.
 
     Deliberately batched with `executemany` for throughput — one UPDATE per
     row is fine for the current ~640-row dataset; if the inventory grows
@@ -411,6 +450,40 @@ def backfill_folder_columns() -> None:
     ex     = excluded_table_name()
     for table in (active, ex):
         _backfill_folder_columns_for(table)
+
+
+def backfill_folder_columns_if_needed() -> int:
+    """Live-backfill worker for the ACTIVE inventory only.
+
+    Cheaper twin of `backfill_folder_columns()` — skips the legacy
+    `_Excluded` sidecar table (which we no longer write to) and returns
+    the number of rows that were updated so the caller can log volume.
+
+    Runs on every /api/contracts read; the initial SELECT is `WHERE
+    (Folder01 IS NULL AND ... Folder20 IS NULL) AND SharePointPath IS
+    NOT NULL` which returns zero rows once the inventory is caught up —
+    so the steady-state cost is a single indexed lookup per read.
+
+    Returns the number of rows updated (0 in the common no-work case)."""
+    n_before = _pending_folder_backfill_count(settings.CONTRACT_TABLE)
+    if n_before == 0:
+        return 0
+    _backfill_folder_columns_for(settings.CONTRACT_TABLE)
+    return n_before
+
+
+def _pending_folder_backfill_count(table: str) -> int:
+    """Return how many rows in `table` still need Folder01..20 backfilled.
+
+    Zero means the live-backfill hot path can bail out with a single
+    indexed COUNT and never open an UPDATE transaction."""
+    null_check = " AND ".join(f"[{c}] IS NULL" for c in FOLDER_COLUMNS)
+    sql = (f"SELECT COUNT(*) FROM dbo.[{table}] "
+           f"WHERE ({null_check}) AND [SharePointPath] IS NOT NULL")
+    with get_connection() as cn:
+        cur = cn.cursor()
+        cur.execute(sql)
+        return int(cur.fetchone()[0] or 0)
 
 
 def _backfill_folder_columns_for(table: str) -> None:
@@ -530,6 +603,26 @@ def _row_to_dict(row) -> dict:
     # (rows remain visible to every logged-in user; this is display, not
     # filter).  Null for rows that have never been submitted.
     out["submittedBy"]            = _s(r.get("SubmittedBy"))
+
+    # ── New-schema fields (ContractInventory1) ─────────────────────────
+    # Surface every additional column so the UI can display and search
+    # over them.  Integer columns pass through as int|null so the client
+    # can format them (e.g. numeric sort on PageCount).
+    _id = r.get("Id")
+    out["id"]                     = int(_id) if isinstance(_id, int) or (isinstance(_id, str) and _id.isdigit()) else None
+    out["folderName"]             = _s(r.get("FolderName"))
+    out["folderType"]             = _s(r.get("FolderType"))
+    out["batchID"]                = _s(r.get("BatchID"))
+    _bn = r.get("BatchNumber")
+    out["batchNumber"]            = int(_bn) if isinstance(_bn, int) or (isinstance(_bn, str) and _bn.isdigit()) else None
+    _pc = r.get("PageCount")
+    out["pageCount"]              = int(_pc) if isinstance(_pc, int) or (isinstance(_pc, str) and _pc.isdigit()) else None
+    _tc = r.get("TextCharacters")
+    out["textCharacters"]         = int(_tc) if isinstance(_tc, int) or (isinstance(_tc, str) and _tc.isdigit()) else None
+    out["endCustomerName"]        = _s(r.get("EndCustomerName"))
+    out["quoteID"]                = _s(r.get("QuoteID"))
+    out["annualFeeIncrease"]      = _s(r.get("AnnualFeeIncrease"))
+    out["feeIncreaseDate"]        = _s(r.get("FeeIncreaseDate"))
     return out
 
 
@@ -554,6 +647,24 @@ def load_contracts(include_excluded: bool = False) -> List[dict]:
     tell them apart without a second lookup.
     """
     _ensure_schema_once()
+
+    # Live folder-column backfill: guarantees rows that landed in the DB
+    # AFTER process start (e.g. a background ingest pipeline INSERTs new
+    # SharePoint documents) get their Folder01..Folder20 populated before
+    # the UI ever sees them.  Cheap in the steady state — a single indexed
+    # COUNT that short-circuits to zero once the inventory is caught up.
+    # Fails soft: any exception is logged and the read proceeds with
+    # whatever folder values the row currently has.
+    try:
+        n_backfilled = backfill_folder_columns_if_needed()
+        if n_backfilled:
+            logger.info(
+                "load_contracts: live-backfilled Folder01..20 on %d new row(s) in dbo.%s",
+                n_backfilled, settings.CONTRACT_TABLE,
+            )
+    except Exception as exc:
+        logger.warning("load_contracts: live folder-backfill failed (proceeding): %s", exc)
+
     cols = ", ".join(f"[{c}]" for c in _COLUMNS)
     # ExcludedDate/ExcludedBy are appended AFTER the fixed _COLUMNS list so
     # _row_to_dict receives its expected column count and the tail-offset

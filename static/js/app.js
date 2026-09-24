@@ -40,6 +40,21 @@ const COL_CFG = [
   { f: 'migrated',               h: 'Migrated (source)',   ft: 'bool', w: 110, hide: true },
   { f: 'runId',                  h: 'Run ID',              ft: 'text', w: 200, hide: true },
   { f: 'sharePointPath',         h: 'SharePoint Path',     ft: 'text', w: 300, hide: true },
+  // ── New-schema fields (dbo.ContractInventory1) ─────────────────────
+  // Grouped under "Contract Details" (extraction extras) so the Columns
+  // picker keeps them together.  Off-by-default to avoid a horizontal-
+  // scroll bomb; users opt-in via the Columns picker.
+  { f: 'id',                     h: 'Row ID',              ft: 'text', w: 80,  hide: true, group: 'Contract Details' },
+  { f: 'folderName',             h: 'Folder Name',         ft: 'text', w: 180, hide: true, group: 'Contract Details' },
+  { f: 'folderType',             h: 'Folder Type',         ft: 'text', w: 120, hide: true, group: 'Contract Details' },
+  { f: 'batchID',                h: 'Batch ID',            ft: 'text', w: 260, hide: true, group: 'Contract Details' },
+  { f: 'batchNumber',            h: 'Batch #',             ft: 'text', w: 80,  hide: true, group: 'Contract Details' },
+  { f: 'pageCount',              h: 'Page Count',          ft: 'text', w: 100, hide: true, group: 'Contract Details' },
+  { f: 'textCharacters',         h: 'Text Chars',          ft: 'text', w: 110, hide: true, group: 'Contract Details' },
+  { f: 'endCustomerName',        h: 'End Customer',        ft: 'text', w: 180, hide: true, group: 'Contract Details' },
+  { f: 'quoteID',                h: 'Quote ID',            ft: 'text', w: 140, hide: true, group: 'Contract Details' },
+  { f: 'annualFeeIncrease',      h: 'Annual Fee Increase', ft: 'text', w: 150, hide: true, group: 'Contract Details' },
+  { f: 'feeIncreaseDate',        h: 'Fee Increase Date',   ft: 'date', w: 130, hide: true, group: 'Contract Details' },
 ];
 
 // ── SharePoint hierarchy columns (Folder 1..20) ─────────────────────────
@@ -65,7 +80,7 @@ for (let i = 1; i <= FOLDER_LEVEL_MAX; i++) {
 // matching level first (matches user intuition — top of the tree wins).
 const FOLDER_FIELDS = Array.from({length: FOLDER_LEVEL_MAX}, (_, i) => `folder${i + 1}`);
 
-const SEARCHABLE = ['fileName','customerName','agreementName','opportunityID','ae','contractType','contractClassification','legalEntity'];
+const SEARCHABLE = ['fileName','customerName','agreementName','opportunityID','ae','contractType','contractClassification','legalEntity','folderName','folderType','batchID','endCustomerName','quoteID'];
 
 /* ── State ──────────────────────────────────────────────────────────────── */
 const state = {

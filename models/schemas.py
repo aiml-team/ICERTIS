@@ -31,6 +31,18 @@ class ContractRecord(BaseModel):
     migrated: Optional[bool] = None
     migratedDate: Optional[str] = None
     runId: Optional[str] = None
+    # ── New-schema fields (dbo.ContractInventory1) ─────────────────────
+    id: Optional[int] = None
+    folderName: Optional[str] = None
+    folderType: Optional[str] = None
+    batchID: Optional[str] = None
+    batchNumber: Optional[int] = None
+    pageCount: Optional[int] = None
+    textCharacters: Optional[int] = None
+    endCustomerName: Optional[str] = None
+    quoteID: Optional[str] = None
+    annualFeeIncrease: Optional[str] = None
+    feeIncreaseDate: Optional[str] = None
 
 
 class ContractsResponse(BaseModel):

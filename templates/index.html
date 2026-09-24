@@ -4,7 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Contract Migration Review</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <!-- Cache-bust: `asset_version` is the file mtime of app.js at server
+       startup — changes on every code deploy so browsers always fetch the
+       freshest CSS/JS instead of a stale localStorage-cached copy.  Same
+       version on every request within a process (bandwidth-friendly). -->
+  <link rel="stylesheet" href="/static/css/style.css?v={{ asset_version }}">
 </head>
 <body>
 <div id="app">
@@ -250,6 +254,6 @@
   <button type="button" class="mp-close" id="mp-close" title="Dismiss">×</button>
 </div>
 
-<script src="/static/js/app.js"></script>
+<script src="/static/js/app.js?v={{ asset_version }}"></script>
 </body>
 </html>
