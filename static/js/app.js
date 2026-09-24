@@ -1614,9 +1614,16 @@ function startResize(e) {
     state.colWidths[resizing.field] = newW;
     const idx = getVisibleCols().findIndex(c => c.f === resizing.field);
     if (idx >= 0) {
+      // Every row has 2 frozen leading cells (Row No. + checkbox) before
+      // the data columns, so the visible column at index `idx` lives at
+      // tr.children[idx + 2].  (Previously off-by-one — used idx + 3 —
+      // which resized the wrong column during the drag; commit anyway
+      // still snapped to the correct column on the next full renderTable
+      // via state.colWidths, so the bug was invisible unless you watched
+      // the live resize closely.) */
       const colIdx = idx + 2;
       document.querySelectorAll(`#table-root tr`).forEach(tr => {
-        const cell = tr.children[colIdx + 1];
+        const cell = tr.children[colIdx];
         if (cell) {
           cell.style.width = newW + 'px';
           cell.style.minWidth = newW + 'px';
