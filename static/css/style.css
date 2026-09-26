@@ -813,40 +813,15 @@ html, body {
   background: #fff;
 }
 
-.excluded-header {
-  flex-shrink: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 24px;
-  padding: 16px 24px 12px 24px;
-  background: #fff;
-  border-bottom: 1px solid #e5e7eb;
+/* Column-header labels in the Excluded table act as sort toggles — same
+   affordance as the review view.  Only style the label span so the
+   funnel filter button next to it keeps its own hover state. */
+#excluded-table-root thead th[data-field] .th-label {
+  cursor: pointer;
+  user-select: none;
 }
-
-.excluded-title-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-}
-
-.excluded-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: #111827;
-  margin: 0;
-  letter-spacing: -0.1px;
-}
-
-.excluded-sub {
-  font-size: 12px;
-  color: #6b7280;
-  line-height: 1.4;
-}
-
-.excluded-back-btn {
-  flex-shrink: 0;
+#excluded-table-root thead th[data-field] .th-label:hover {
+  color: #0f6cbd;
 }
 
 /* ── Active filter chips bar ───────────────────────────────────────────── */
@@ -3018,14 +2993,6 @@ tr.row-in-processing:hover td { background: #f3ecfe !important; }
     justify-content: center;
     flex-wrap: wrap;
     margin-left: 0;
-  }
-
-  /* Excluded view header: title + Export CSV stack vertically. */
-  .excluded-header {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
-    padding: 12px 12px 10px;
   }
 
   /* Column-picker popup: fit to viewport, scroll vertically for long lists.

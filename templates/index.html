@@ -209,19 +209,51 @@
          Reuses the same page shell (buckets remain visible so the user can
          click back to "Total"/"Pending" to return to the active list). -->
     <div class="excluded-view" id="excluded-view" style="display:none">
-      <div class="excluded-header">
-        <div class="excluded-title-wrap">
-          <h2 class="excluded-title">Excluded Documents</h2>
-          <span class="excluded-sub" id="excluded-sub">These documents have been excluded from the migration review list. They are not deleted and can be restored.</span>
+      <!-- Excluded view toolbar: mirrors the review-view toolbar layout
+           exactly (search + Clear Filters + Columns + Folder Filter on the
+           left, Export CSV on the right) so both bucket views feel
+           identical.  Per-column funnel filters are rendered inline in the
+           table headers by renderExcludedTable(). -->
+      <div class="toolbar" id="excluded-toolbar">
+        <div class="tb-left">
+          <div class="tb-search">
+            <span class="tb-search-icon">&#8981;</span>
+            <input type="text" id="excluded-search-input" placeholder="Search files, customers, agreements…" autocomplete="off">
+            <button class="tb-search-clear" id="excluded-search-clear" title="Clear search">&#x2715;</button>
+          </div>
+          <button class="tb-btn" id="excluded-clear-filters-btn" disabled>Clear Filters</button>
+          <!-- Columns picker for the Excluded view (parity with the review
+               toolbar).  Reuses the same dropdown implementation but the
+               visible columns are drawn from EXCLUDED_COL_POOL. -->
+          <div id="excluded-col-btn-wrap" class="col-btn-wrap">
+            <button class="tb-btn" id="excluded-col-btn">Columns &#9660;</button>
+          </div>
+          <!-- Folder Filter for the Excluded view — matches the review
+               toolbar.  Opens the same popover so users can filter excluded
+               documents by any folder level (Folder 1..20) across all
+               customers. -->
+          <div id="excluded-folder-filter-btn-wrap" class="col-btn-wrap">
+            <button class="tb-btn" id="excluded-folder-filter-btn" type="button"
+                    title="Filter by any folder level across all customers">
+              <span aria-hidden="true">&#128269;</span>
+              <span id="excluded-folder-filter-btn-label">Folder Filter</span>
+              <span aria-hidden="true">&#9660;</span>
+            </button>
+          </div>
         </div>
-        <!-- Export CSV for the Excluded bucket.  Same handler as the review-view
-             button; exportCsv() branches on state.currentView so this exports
-             state.excludedData (the full excluded set, not the current page). -->
-        <button class="tb-btn tb-export-btn" id="excluded-export-csv-btn" type="button" title="Export all excluded documents as CSV">
-          <span class="tb-export-icon" aria-hidden="true">&#8681;</span>
-          Export CSV
-        </button>
+        <div class="tb-right">
+          <!-- Export CSV for the Excluded bucket.  Same handler as the
+               review-view button; exportCsv() branches on state.currentView
+               so this exports the currently-filtered excluded set. -->
+          <button class="tb-btn tb-export-btn" id="excluded-export-csv-btn" type="button" title="Export excluded documents as CSV">
+            <span class="tb-export-icon" aria-hidden="true">&#8681;</span>
+            Export CSV
+          </button>
+        </div>
       </div>
+
+      <!-- Active filter chips for the Excluded view -->
+      <div class="af-bar" id="excluded-af-bar" style="display:none"></div>
 
       <div class="grid-wrap">
         <div class="table-container" style="display:none">

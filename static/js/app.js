@@ -139,6 +139,25 @@ const state = {
   excludedSelectedIds: new Set(),
   excludedPage:       1,
   excludedLoaded:     false,      // set true after first /api/excluded fetch
+  // Excluded-view filter state — mirrors state.columnFilters /
+  // state.globalSearch for the review view, kept separate so switching
+  // between the two views doesn't cross-contaminate filters.
+  excludedColumnFilters: {},
+  excludedSearch:        '',
+  excludedSortCol:       null,
+  excludedSortDir:       'asc',
+  // Per-view column visibility.  Populated lazily on first
+  // renderExcludedTable() run so the Excluded view starts with its
+  // legacy compact set (EXCLUDED_DEFAULT_VISIBLE) while still letting
+  // the user opt into every COL_CFG field via the Columns picker.
+  excludedHiddenCols:    null,
+  // Independent folder-filter state for the Excluded view.  Same shape
+  // as state.folderFilter (text + mode) so it can share the popover UI.
+  excludedFolderFilter:  { text: '', mode: 'contains' },
+  // Cached filtered/sorted view of state.excludedData, produced by
+  // applyExcludedFiltersAndSort().  renderExcludedTable() reads from
+  // here instead of state.excludedData directly.
+  excludedFilteredData:  [],
   // Server-authoritative population counts (from /api/contracts.counts).
   // `total` = active + excluded (matches the Total Documents bucket which
   // shows every row on the master table).  `active` excludes rows with
@@ -194,6 +213,15 @@ try {
 } catch {}
 state.hiddenCols.delete('migrate');
 state.hiddenCols.delete('migratedDate');
+
+// Restore Excluded view column visibility.  Kept in a separate key so
+// showing extra columns in the Excluded view doesn't clutter the main
+// review grid.  When absent, state.excludedHiddenCols is lazy-init'd on
+// first render to the "default visible" set defined further down.
+try {
+  const s = localStorage.getItem('cmr-excluded-hidden');
+  if (s) state.excludedHiddenCols = new Set(JSON.parse(s));
+} catch {}
 
 /* ── Utility ────────────────────────────────────────────────────────────── */
 function cellStr(row, field) {
@@ -1336,6 +1364,23 @@ function _syncFolderFilterButton() {
   }
 }
 
+/** Sibling to _syncFolderFilterButton() for the Excluded view.  Reflects
+ *  state.excludedFolderFilter on the excluded-toolbar Folder Filter button. */
+function _syncExcludedFolderFilterButton() {
+  const btn = document.getElementById('excluded-folder-filter-btn');
+  const lbl = document.getElementById('excluded-folder-filter-btn-label');
+  if (!btn || !lbl) return;
+  const ff = state.excludedFolderFilter || {};
+  if (ff.text && ff.text.trim()) {
+    btn.classList.add('has-selection');
+    const modeLabel = { contains: 'contains', starts_with: 'starts', exact: 'exact' }[ff.mode] || '';
+    lbl.textContent = `Folder ${modeLabel}: ${ff.text}`;
+  } else {
+    btn.classList.remove('has-selection');
+    lbl.textContent = 'Folder Filter';
+  }
+}
+
 /* ── Summary buckets ────────────────────────────────────────────────────── */
 function updateBuckets() {
   // KPI identity per manager spec:
@@ -1654,22 +1699,37 @@ function openFilterPanel(field, rect) {
   state.activeFilter = field;
 
   // File Name uses an enhanced composite panel that shows the value-list
-  // AND advanced text-condition filter together in one popup.
-  if (field === 'fileName') {
+  // AND advanced text-condition filter together in one popup.  Only wired
+  // up for the review view (the excluded view uses the simpler single-tab
+  // panel — no separate composite popup is needed there).
+  if (field === 'fileName' && state.currentView !== 'excluded') {
     return openFileNameFilterPanel(field, rect);
   }
 
-  const col = COL_CFG.find(c => c.f === field);
-  const filter = state.columnFilters[field] || null;
+  // View-aware bindings.  All popup UI is shared between review and
+  // excluded — only the underlying data source, filter map, and search
+  // string change.
+  const isExcluded = state.currentView === 'excluded';
+  const filterMap  = isExcluded ? state.excludedColumnFilters : state.columnFilters;
+  const dataSource = isExcluded ? (state.excludedData || []) : state.allData;
+  const searchStr  = isExcluded ? state.excludedSearch      : state.globalSearch;
+  const searchable = isExcluded ? getExcludedSearchable()   : SEARCHABLE;
+  // Column definition: in the excluded view, prefer the excluded-view
+  // column pool (adds `excludedDate` and lets user-picked extras filter),
+  // then fall back to COL_CFG.
+  const col = (isExcluded
+    ? (EXCLUDED_COL_POOL.find(c => c.f === field) || COL_CFG.find(c => c.f === field))
+    : COL_CFG.find(c => c.f === field));
+  const filter = filterMap[field] || null;
 
-  const dataForValues = state.allData.filter(row => {
-    for (const [f, flt] of Object.entries(state.columnFilters)) {
+  const dataForValues = dataSource.filter(row => {
+    for (const [f, flt] of Object.entries(filterMap)) {
       if (f === field || !flt) continue;
       if (!passesFilter(row, f, flt)) return false;
     }
-    if (state.globalSearch.trim()) {
-      const q = state.globalSearch.toLowerCase();
-      if (!SEARCHABLE.some(sf => cellStr(row, sf).toLowerCase().includes(q))) return false;
+    if ((searchStr || '').trim()) {
+      const q = searchStr.toLowerCase();
+      if (!searchable.some(sf => cellStr(row, sf).toLowerCase().includes(q))) return false;
     }
     return true;
   });
@@ -1845,19 +1905,24 @@ function openFilterPanel(field, rect) {
 
   function doApply() {
     if (tab === 'values') {
-      state.columnFilters[field] = selSet.size > 0 ? { type: 'set', values: [...selSet] } : null;
+      filterMap[field] = selSet.size > 0 ? { type: 'set', values: [...selSet] } : null;
     } else if (tab === 'text') {
       const op = document.getElementById('fp-text-op')?.value || 'contains';
       const val = document.getElementById('fp-text-val')?.value?.trim() || '';
-      state.columnFilters[field] = val ? { type: 'text', op, value: val } : null;
+      filterMap[field] = val ? { type: 'text', op, value: val } : null;
     } else if (tab === 'date') {
       const op = document.getElementById('fp-date-op')?.value || 'equals';
       const from = document.getElementById('fp-date-from')?.value || '';
       const to = document.getElementById('fp-date-to')?.value || '';
-      state.columnFilters[field] = from ? { type: 'date', op, from, to } : null;
+      filterMap[field] = from ? { type: 'date', op, from, to } : null;
     }
-    applyFiltersAndSort();
-    renderAll();
+    if (isExcluded) {
+      state.excludedPage = 1;
+      renderExcludedTable();
+    } else {
+      applyFiltersAndSort();
+      renderAll();
+    }
     closeFilterPanel();
   }
 
@@ -1889,10 +1954,17 @@ function openFilterPanel(field, rect) {
   document.querySelectorAll('.fp-sort-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const dir = btn.dataset.sort;
-      state.sortCol = field;
-      state.sortDir = dir;
-      applyFiltersAndSort();
-      renderAll();
+      if (isExcluded) {
+        state.excludedSortCol = field;
+        state.excludedSortDir = dir;
+        state.excludedPage = 1;
+        renderExcludedTable();
+      } else {
+        state.sortCol = field;
+        state.sortDir = dir;
+        applyFiltersAndSort();
+        renderAll();
+      }
       closeFilterPanel();
     });
   });
@@ -1901,9 +1973,14 @@ function openFilterPanel(field, rect) {
   document.getElementById('fp-cancel').addEventListener('click', closeFilterPanel);
   document.getElementById('fp-backdrop').addEventListener('click', closeFilterPanel);
   document.getElementById('fp-clear').addEventListener('click', () => {
-    state.columnFilters[field] = null;
-    applyFiltersAndSort();
-    renderAll();
+    filterMap[field] = null;
+    if (isExcluded) {
+      state.excludedPage = 1;
+      renderExcludedTable();
+    } else {
+      applyFiltersAndSort();
+      renderAll();
+    }
     closeFilterPanel();
   });
   document.getElementById('fp-apply').addEventListener('click', doApply);
@@ -2133,18 +2210,35 @@ function closeFilterPanel() {
 
 /* ── Column visibility panel ────────────────────────────────────────────── */
 function openColPanel() {
-  const wrap = $('col-btn-wrap');
+  // Route based on the current view so the same button in each toolbar
+  // opens the correct picker (review vs. excluded).  The excluded view
+  // has its own column pool + hiddenCols set so column visibility can
+  // differ between the two views.
+  const isExcluded = state.currentView === 'excluded';
+  const wrap = isExcluded ? $('excluded-col-btn-wrap') : $('col-btn-wrap');
+  if (!wrap) return;
   if (document.getElementById('colpanel')) {
     closeColPanel();
     return;
   }
+
+  // Ensure lazy-init so state.excludedHiddenCols is populated before
+  // the picker renders (matches renderExcludedTable() behaviour).
+  if (isExcluded) getExcludedVisibleCols();
+
+  const pool         = isExcluded ? EXCLUDED_COL_POOL : COL_CFG;
+  const hiddenSet    = isExcluded ? state.excludedHiddenCols : state.hiddenCols;
+  const persistKey   = isExcluded ? 'cmr-excluded-hidden' : 'cmr-hidden';
+  const rerender     = isExcluded
+    ? () => { renderExcludedTable(); }
+    : () => { renderAll(); };
 
   // Bucket columns by their `group` tag so the picker can render section
   // headings (§17 spec: "General" + "SharePoint Hierarchy").  Untagged
   // columns fall into the leading "General" bucket in original order.
   const groups = new Map();
   groups.set('General', []);
-  for (const c of COL_CFG) {
+  for (const c of pool) {
     const g = c.group || 'General';
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(c);
@@ -2156,13 +2250,15 @@ function openColPanel() {
   // already force-restored on page load (see hiddenCols init above)
   // and included here so the bulk action stays consistent with that
   // invariant instead of showing them briefly-hidden between clicks.
-  const MANDATORY_FIELDS = new Set(['fileName', 'migrate', 'migratedDate']);
+  const MANDATORY_FIELDS = isExcluded
+    ? new Set(['fileName', 'excludedDate'])
+    : new Set(['fileName', 'migrate', 'migratedDate']);
 
   const renderGroup = (title, cols) => {
     if (!cols.length) return '';
     const rows = cols.map(c => `
         <label class="colpanel-row">
-          <input type="checkbox" class="col-toggle" data-field="${c.f}" ${!state.hiddenCols.has(c.f)?'checked':''}>
+          <input type="checkbox" class="col-toggle" data-field="${c.f}" ${!hiddenSet.has(c.f)?'checked':''}>
           ${esc(c.h)}
         </label>`).join('');
     // Section headings stay untouched — only the group-level Show/Hide
@@ -2200,10 +2296,10 @@ function openColPanel() {
   mount.querySelectorAll('.col-toggle').forEach(cb => {
     cb.addEventListener('change', () => {
       const f = cb.dataset.field;
-      if (cb.checked) state.hiddenCols.delete(f);
-      else state.hiddenCols.add(f);
-      localStorage.setItem('cmr-hidden', JSON.stringify([...state.hiddenCols]));
-      renderAll();
+      if (cb.checked) hiddenSet.delete(f);
+      else hiddenSet.add(f);
+      try { localStorage.setItem(persistKey, JSON.stringify([...hiddenSet])); } catch {}
+      rerender();
     });
   });
 
@@ -2216,20 +2312,20 @@ function openColPanel() {
     btn.addEventListener('click', (ev) => {
       ev.preventDefault();
       const action = btn.dataset.action;                // 'show' | 'hide'
-      for (const c of COL_CFG) {
+      for (const c of pool) {
         if (action === 'show') {
-          state.hiddenCols.delete(c.f);
+          hiddenSet.delete(c.f);
         } else {
           if (MANDATORY_FIELDS.has(c.f)) continue;      // keep visible
-          state.hiddenCols.add(c.f);
+          hiddenSet.add(c.f);
         }
       }
-      localStorage.setItem('cmr-hidden', JSON.stringify([...state.hiddenCols]));
+      try { localStorage.setItem(persistKey, JSON.stringify([...hiddenSet])); } catch {}
       // Reflect the new checked state without tearing down the panel.
       mount.querySelectorAll('.col-toggle').forEach(cb => {
-        cb.checked = !state.hiddenCols.has(cb.dataset.field);
+        cb.checked = !hiddenSet.has(cb.dataset.field);
       });
-      renderAll();
+      rerender();
     });
   });
 
@@ -2246,15 +2342,20 @@ function closeColPanel() {
  * Rendered inside #folder-filter-btn-wrap using the same absolute-under-
  * button positioning pattern as the Columns and Folder-navigator panels. */
 function openFolderFilterPanel() {
-  const wrap = document.getElementById('folder-filter-btn-wrap');
+  // View-aware routing: the same button implementation drives both the
+  // review and excluded toolbars, but each writes to its own folderFilter
+  // slice so filters don't leak between views.
+  const isExcluded = state.currentView === 'excluded';
+  const wrap = document.getElementById(isExcluded ? 'excluded-folder-filter-btn-wrap' : 'folder-filter-btn-wrap');
   if (!wrap) return;
   if (document.getElementById('folder-filter-panel')) {
     closeFolderFilterPanel();
     return;
   }
 
-  const curText = state.folderFilter.text || '';
-  const curMode = state.folderFilter.mode || 'contains';
+  const ffState = isExcluded ? state.excludedFolderFilter : state.folderFilter;
+  const curText = ffState.text || '';
+  const curMode = ffState.mode || 'contains';
   const modeOpt = (v, l) => `<option value="${v}"${v === curMode ? ' selected' : ''}>${l}</option>`;
 
   const html = `
@@ -2295,22 +2396,37 @@ function openFolderFilterPanel() {
   const textEl = document.getElementById('ff-text');
   const modeEl = document.getElementById('ff-mode');
   const apply = () => {
-    state.folderFilter = {
+    const next = {
       text: (textEl.value || '').trim(),
       mode: modeEl.value || 'contains',
     };
-    _syncFolderFilterButton();
-    state.page = 1;                        // §16: reset pagination for filter
-    applyFiltersAndSort();
-    renderAll();
+    if (isExcluded) {
+      state.excludedFolderFilter = next;
+      _syncExcludedFolderFilterButton();
+      state.excludedPage = 1;
+      renderExcludedTable();
+    } else {
+      state.folderFilter = next;
+      _syncFolderFilterButton();
+      state.page = 1;                    // §16: reset pagination for filter
+      applyFiltersAndSort();
+      renderAll();
+    }
     closeFolderFilterPanel();
   };
   const clearAndClose = () => {
-    state.folderFilter = { text: '', mode: 'contains' };
-    _syncFolderFilterButton();
-    state.page = 1;
-    applyFiltersAndSort();
-    renderAll();
+    if (isExcluded) {
+      state.excludedFolderFilter = { text: '', mode: 'contains' };
+      _syncExcludedFolderFilterButton();
+      state.excludedPage = 1;
+      renderExcludedTable();
+    } else {
+      state.folderFilter = { text: '', mode: 'contains' };
+      _syncFolderFilterButton();
+      state.page = 1;
+      applyFiltersAndSort();
+      renderAll();
+    }
     closeFolderFilterPanel();
   };
 
@@ -3605,50 +3721,213 @@ const restorationService = {
 
 /* ── Excluded view ─────────────────────────────────────────────────────────
  * Renders state.excludedData in its own table with a Restore action bar.
- * Reuses COL_CFG for column definitions but omits filter/sort UI — the
- * excluded list is small and chronologically ordered by ExcludedDate DESC.
+ * Reuses COL_CFG for column definitions and now supports the same
+ * global-search + per-column funnel filters as the review view (parity
+ * request 2026-09-25 — "add the filtering option for exclude bucket also").
  * ────────────────────────────────────────────────────────────────────────── */
 
-// Columns shown in the excluded table.  Deliberately a smaller, fixed subset
-// so the recovery UI stays uncluttered; the DB row is intact and fully
-// restored on Restore regardless of what's displayed here.
-const EXCLUDED_COLS = [
-  { f: 'fileName',      h: 'File Name',      w: 260 },
-  { f: 'customerName',  h: 'Customer Name',  w: 170 },
-  { f: 'agreementName', h: 'Agreement Name', w: 210 },
-  { f: 'contractType',  h: 'Contract Type',  w: 120 },
-  { f: 'migrate',       h: 'Migrate',        w: 80  },
-  { f: 'excludedDate',  h: 'Excluded Date',  w: 180 },
-  { f: 'fileID',        h: 'File ID',        w: 90  },
+// Virtual "Excluded Date" column — not in COL_CFG because the master
+// table doesn't expose it in the review grid.  Declared here so the
+// Columns picker and openFilterPanel() can find it by field name and so
+// its `ft: 'date'` triggers the Date Filter tab in the popover.
+const EXCLUDED_DATE_COL = { f: 'excludedDate', h: 'Excluded Date', w: 180, ft: 'date' };
+
+// Default-visible columns for the Excluded view.  Kept intentionally
+// compact so the recovery UI stays uncluttered on first open; the user
+// can toggle any other COL_CFG field on/off via the Columns picker.
+const EXCLUDED_DEFAULT_VISIBLE = [
+  'fileName', 'customerName', 'agreementName', 'contractType',
+  'migrate', 'excludedDate', 'fileID',
 ];
+
+// Full pool of columns the Excluded Columns picker can show — every
+// COL_CFG entry plus the virtual excludedDate column.  Widths / labels /
+// filter-types are all inherited from COL_CFG, so any change to the
+// review columns automatically flows into the Excluded picker too.
+const EXCLUDED_COL_POOL = [EXCLUDED_DATE_COL, ...COL_CFG];
+
+/* Returns the ORDERED list of column definitions currently rendered in
+ * the Excluded table.  The order matches EXCLUDED_DEFAULT_VISIBLE (for
+ * the legacy fields) followed by any additional columns the user opted
+ * into via the Columns picker, in COL_CFG order.  Filters, sort and
+ * search all consume this list so behaviour stays consistent. */
+function getExcludedVisibleCols() {
+  // Lazy-init on first use so state stays consistent across reloads.
+  if (state.excludedHiddenCols == null) {
+    state.excludedHiddenCols = new Set(
+      EXCLUDED_COL_POOL.map(c => c.f).filter(f => !EXCLUDED_DEFAULT_VISIBLE.includes(f))
+    );
+  }
+  const shown = new Set(EXCLUDED_COL_POOL.map(c => c.f).filter(f => !state.excludedHiddenCols.has(f)));
+  const cols = [];
+  // Preserve the default-visible order for familiarity.
+  for (const f of EXCLUDED_DEFAULT_VISIBLE) {
+    if (shown.has(f)) {
+      const cfg = EXCLUDED_COL_POOL.find(c => c.f === f);
+      if (cfg) { cols.push(cfg); shown.delete(f); }
+    }
+  }
+  // Then any extras the user added, in the pool's canonical order.
+  for (const c of EXCLUDED_COL_POOL) if (shown.has(c.f)) cols.push(c);
+  return cols;
+}
+
+// Fields the excluded-view global search scans.  Mirrors SEARCHABLE but
+// dynamically follows whichever columns are currently visible so the
+// search always matches what the user can see.
+function getExcludedSearchable() {
+  return getExcludedVisibleCols().map(c => c.f);
+}
+
+
+
+/* Filter + sort pipeline for state.excludedData.  Mirrors
+ * applyFiltersAndSort() but operates on the excluded cache and its own
+ * filter/search/sort state so the two views stay independent.  Populates
+ * state.excludedFilteredData in place. */
+function applyExcludedFiltersAndSort() {
+  let d = (state.excludedData || []).slice();
+
+  // Clear folder-match annotations from a previous pass so removed
+  // filters don't leave stale tooltips on the surviving rows.
+  for (const r of d) { if (r.__folderMatch) delete r.__folderMatch; }
+
+  // Global folder filter (same UX as review view but scoped to excluded
+  // rows).  Annotates each matching row with __folderMatch so downstream
+  // renderers can show which folder level triggered the match.
+  const ff = state.excludedFolderFilter || {};
+  if (ff.text && ff.text.trim()) {
+    const match = _folderFilterMatcher(ff.text, ff.mode || 'contains');
+    if (match) {
+      const survivors = [];
+      for (const r of d) {
+        const m = _matchFolderInRow(r, match);
+        if (m) {
+          r.__folderMatch = m;
+          survivors.push(r);
+        }
+      }
+      d = survivors;
+    }
+  }
+
+  const q = (state.excludedSearch || '').trim().toLowerCase();
+  if (q) {
+    const searchFields = getExcludedSearchable();
+    d = d.filter(r => searchFields.some(f => cellStr(r, f).toLowerCase().includes(q)));
+  }
+  for (const [field, filter] of Object.entries(state.excludedColumnFilters)) {
+    if (filter) d = d.filter(r => passesFilter(r, field, filter));
+  }
+
+  if (state.excludedSortCol) {
+    const colDef = EXCLUDED_COL_POOL.find(c => c.f === state.excludedSortCol);
+    // 'rowNumber' is the frozen leading "#" column — sort as an integer
+    // so 2 < 10 and NULLs sink to the end regardless of direction.
+    const isRowNumber = state.excludedSortCol === 'rowNumber';
+    const ft = colDef ? colDef.ft : (isRowNumber ? 'number' : 'text');
+    d = [...d].sort((a, b) => {
+      let cmp = 0;
+      if (ft === 'number') {
+        const na = a[state.excludedSortCol], nb = b[state.excludedSortCol];
+        if (na == null && nb == null) return 0;
+        if (na == null) return 1;
+        if (nb == null) return -1;
+        cmp = na - nb;
+      } else if (ft === 'date') {
+        const da = parseDate(cellStr(a, state.excludedSortCol));
+        const db = parseDate(cellStr(b, state.excludedSortCol));
+        cmp = (da || 0) > (db || 0) ? 1 : (da || 0) < (db || 0) ? -1 : 0;
+      } else {
+        const va = cellStr(a, state.excludedSortCol);
+        const vb = cellStr(b, state.excludedSortCol);
+        cmp = va.localeCompare(vb, undefined, { sensitivity: 'base', numeric: true });
+      }
+      return state.excludedSortDir === 'desc' ? -cmp : cmp;
+    });
+  }
+
+  state.excludedFilteredData = d;
+}
 
 function renderExcludedTable() {
   const container = document.querySelector('#excluded-view .table-container');
   const empty     = $('excluded-empty');
-  const rows      = state.excludedData || [];
+  const totalRows = (state.excludedData || []).length;
 
-  if (rows.length === 0) {
+  // Refresh the filtered/sorted view every render so it stays in sync
+  // with state.excludedData mutations (exclude / restore).
+  applyExcludedFiltersAndSort();
+  const allRows = state.excludedFilteredData || [];
+
+  if (totalRows === 0) {
     if (container) container.style.display = 'none';
-    if (empty) empty.style.display = '';
-    // Clear header selection state
+    if (empty) {
+      empty.textContent = 'No excluded documents.';
+      empty.style.display = '';
+    }
+    renderExcludedActiveFilters();
+    updateExcludedClearFiltersBtn();
+    renderExcludedPager(0);
+    return;
+  }
+  // Filters active but nothing matches — show the same "no records" hint
+  // as the review view so the user understands the empty state is a
+  // filter result, not an empty bucket.
+  if (allRows.length === 0) {
+    if (container) container.style.display = 'none';
+    if (empty) {
+      empty.textContent = 'No excluded documents match the current filters.';
+      empty.style.display = '';
+    }
+    renderExcludedActiveFilters();
+    updateExcludedClearFiltersBtn();
+    renderExcludedPager(0);
     return;
   }
   if (container) container.style.display = '';
   if (empty) empty.style.display = 'none';
 
+  // Pagination — mirrors the review view: fixed 100 rows/page, clamp
+  // state.excludedPage so filter changes that shrink the result set
+  // never leave the user stranded past the end.
+  const perPage    = state.pageSize || 100;
+  const totalPages = Math.max(1, Math.ceil(allRows.length / perPage));
+  if (!Number.isFinite(state.excludedPage) || state.excludedPage < 1) state.excludedPage = 1;
+  if (state.excludedPage > totalPages) state.excludedPage = totalPages;
+  const start = (state.excludedPage - 1) * perPage;
+  const rows  = allRows.slice(start, start + perPage);
+
   let thead = '<thead><tr>';
-  // Frozen "Row No." header — same permanent RowNumber used in the main
-  // view.  Not sortable in the excluded view (rows are already ordered
-  // by ExcludedDate DESC per the load_excluded() server contract).
-  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn" style="width:80px;min-width:80px;max-width:80px" title="Row No.">Row No.</th>`;
+  // Frozen "Row No." header — click to toggle asc/desc sort on the
+  // permanent server-assigned RowNumber.  Same UX as the review view;
+  // no filter popover (a monotonic integer doesn't need text/date
+  // filters).  Handler is wired directly in attachExcludedTableEvents().
+  const rnSortIcon = state.excludedSortCol === 'rowNumber'
+    ? (state.excludedSortDir === 'asc' ? ' <span class="th-sort-icon">&#9650;</span>' : ' <span class="th-sort-icon">&#9660;</span>')
+    : '';
+  thead += `<th class="col-rn col-frozen col-frozen-0 cell-rn th-sortable" id="excluded-th-rownumber" style="width:80px;min-width:80px;max-width:80px;cursor:pointer;" title="Click to sort by Row No.">Row No.${rnSortIcon}</th>`;
   thead += `<th class="col-cb col-frozen col-frozen-1 th-cb-hdr" style="width:44px;min-width:44px;max-width:44px;" title="Select all rows"><input type="checkbox" id="excluded-hdr-check"></th>`;
 
-  EXCLUDED_COLS.forEach((col, idx) => {
+  // Funnel SVG icon shared with the review view — same visual weight.
+  const filterIcon = `<svg class="th-filter-svg" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M2 3h12a.5.5 0 0 1 .4.8L10 9.6V13a.5.5 0 0 1-.28.45l-2 1A.5.5 0 0 1 7 14V9.6L1.6 3.8A.5.5 0 0 1 2 3z" fill="currentColor"/></svg>`;
+
+  const visibleCols = getExcludedVisibleCols();
+  visibleCols.forEach((col, idx) => {
     const isFirst = idx === 0;
     const frozen = isFirst ? 'col-frozen col-frozen-2' : '';
     const frozenStyle = isFirst ? 'position:sticky;left:124px;z-index:15;background:#eaeff5;' : '';
-    thead += `<th class="${frozen}" style="${frozenStyle}width:${col.w}px;min-width:${col.w}px;max-width:${col.w}px">
-      <div class="th-inner"><span class="th-label">${esc(col.h)}</span></div>
+    const hasFilter = !!state.excludedColumnFilters[col.f];
+    const filterActive = hasFilter ? 'active' : '';
+    const sortIcon = state.excludedSortCol === col.f
+      ? (state.excludedSortDir === 'asc' ? ' <span class="th-sort-icon">&#9650;</span>' : ' <span class="th-sort-icon">&#9660;</span>')
+      : '';
+    const filterTitle = hasFilter ? `Filter active — ${esc(col.h)}` : `Filter ${esc(col.h)}`;
+    thead += `<th class="${frozen}" style="${frozenStyle}width:${col.w}px;min-width:${col.w}px;max-width:${col.w}px" data-field="${col.f}">
+      <div class="th-inner">
+        <span class="th-label">${esc(col.h)}${sortIcon}</span>
+        <button class="th-filter-btn excluded-th-filter-btn ${filterActive}" data-field="${col.f}" title="${filterTitle}" aria-label="${filterTitle}">${filterIcon}</button>
+      </div>
     </th>`;
   });
   thead += '</tr></thead>';
@@ -3658,13 +3937,13 @@ function renderExcludedTable() {
     const isSelected = state.excludedSelectedIds.has(row.fileID);
     const classes = isSelected ? 'row-selected' : '';
     tbody += `<tr class="${classes}" data-id="${esc(row.fileID)}">`;
-    // See main table above — same permanent RowNumber, falls back to
-    // page-relative index only when the server value is not yet assigned.
-    const rnDisplay = (row.rowNumber != null) ? row.rowNumber : (i + 1);
+    // See main table above — same permanent RowNumber, falls back to the
+    // global filtered-index only when the server value is not yet assigned.
+    const rnDisplay = (row.rowNumber != null) ? row.rowNumber : (start + i + 1);
     tbody += `<td class="col-rn col-frozen col-frozen-0 cell-rn" style="width:80px;min-width:80px;max-width:80px" title="Row #${rnDisplay}">${rnDisplay}</td>`;
     tbody += `<td class="col-cb col-frozen col-frozen-1 cell-cb" style="width:44px;min-width:44px;max-width:44px"><input type="checkbox" class="excluded-row-check" data-id="${esc(row.fileID)}" ${isSelected ? 'checked' : ''}></td>`;
 
-    EXCLUDED_COLS.forEach((col, idx) => {
+    visibleCols.forEach((col, idx) => {
       const isFirst = idx === 0;
       // See note in renderTable() — no inline background; .col-frozen CSS
       // supplies opaque per-state background-color so sticky cells occlude
@@ -3687,13 +3966,90 @@ function renderExcludedTable() {
   $('excluded-table-root').innerHTML = thead + tbody;
   attachExcludedTableEvents();
   updateExcludedHdrCheckbox();
+  // Keep the active-filter chip bar and Clear Filters button in sync
+  // whenever the table re-renders (filter apply, search input, sort click).
+  renderExcludedActiveFilters();
+  updateExcludedClearFiltersBtn();
+  renderExcludedPager(totalPages);
+}
+
+/* Pager for the Excluded view — mirrors renderPager() exactly, but binds
+ * clicks to state.excludedPage and re-renders only the excluded table
+ * so the review view isn't touched.  Kept as a separate function (rather
+ * than parameterising renderPager) so future review-view pager tweaks
+ * remain independent of the excluded flow. */
+function renderExcludedPager(totalPages) {
+  const container = $('excluded-pager');
+  if (!container) return;
+  if (!totalPages || totalPages <= 1) {
+    // Single page (or zero rows) — nothing to navigate.  Match the
+    // review pager's behaviour of showing a single "1" so users still
+    // see the pagination affordance rather than a gap in the toolbar.
+    if (!totalPages) { container.innerHTML = ''; return; }
+  }
+  const p = state.excludedPage;
+  let html = `<button class="pg-btn" id="excl-pg-prev" ${p <= 1 ? 'disabled' : ''}>&#8249;</button>`;
+
+  const pages = pagesToShow(p, totalPages);
+  let prev = null;
+  pages.forEach(n => {
+    if (prev !== null && n - prev > 1) html += `<span style="padding:0 4px;color:#9ca3af;">&#8230;</span>`;
+    html += `<button class="pg-btn${n === p ? ' active' : ''}" data-page="${n}">${n}</button>`;
+    prev = n;
+  });
+
+  html += `<button class="pg-btn" id="excl-pg-next" ${p >= totalPages ? 'disabled' : ''}>&#8250;</button>`;
+  container.innerHTML = html;
+
+  container.querySelectorAll('[data-page]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.excludedPage = parseInt(btn.dataset.page);
+      renderExcludedTable();
+    });
+  });
+  const prev_btn = $('excl-pg-prev');
+  const next_btn = $('excl-pg-next');
+  if (prev_btn) prev_btn.addEventListener('click', () => {
+    if (state.excludedPage > 1) { state.excludedPage--; renderExcludedTable(); }
+  });
+  if (next_btn) next_btn.addEventListener('click', () => {
+    if (state.excludedPage < totalPages) { state.excludedPage++; renderExcludedTable(); }
+  });
+}
+
+/* IDs of the excluded rows currently rendered on this page.  Mirrors
+ * getPageIds() in the review view so the header "Select all" checkbox
+ * only toggles what the user can actually see. */
+function getExcludedPageIds() {
+  const perPage = state.pageSize || 100;
+  const start = (state.excludedPage - 1) * perPage;
+  return (state.excludedFilteredData || []).slice(start, start + perPage).map(r => r.fileID);
 }
 
 function attachExcludedTableEvents() {
+  // Frozen "Row No." header — click to toggle asc/desc sort on the
+  // permanent RowNumber.  Same UX as the review view; no filter popover.
+  const rnHdr = document.getElementById('excluded-th-rownumber');
+  if (rnHdr) {
+    rnHdr.addEventListener('click', () => {
+      if (state.excludedSortCol === 'rowNumber') {
+        state.excludedSortDir = state.excludedSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.excludedSortCol = 'rowNumber';
+        state.excludedSortDir = 'asc';
+      }
+      state.excludedPage = 1;
+      renderExcludedTable();
+    });
+  }
+
   const hdr = document.getElementById('excluded-hdr-check');
   if (hdr) {
     hdr.addEventListener('change', () => {
-      const ids = state.excludedData.map(r => r.fileID);
+      // Header checkbox toggles only the CURRENT PAGE — matches the
+      // review view.  Rows on other pages retain their prior selection
+      // state so paging back doesn't wipe user choices.
+      const ids = getExcludedPageIds();
       if (hdr.checked) ids.forEach(id => state.excludedSelectedIds.add(id));
       else ids.forEach(id => state.excludedSelectedIds.delete(id));
       renderExcludedTable();
@@ -3701,6 +4057,38 @@ function attachExcludedTableEvents() {
       updateBuckets();
     });
   }
+
+  // Per-column funnel filter buttons — reuse the shared openFilterPanel()
+  // popover so users get the same Values / Text / Date experience as in
+  // the review view.  openFilterPanel() branches on state.currentView to
+  // read/write the correct filter map.
+  document.querySelectorAll('.excluded-th-filter-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const field = btn.dataset.field;
+      const rect = btn.getBoundingClientRect();
+      openFilterPanel(field, rect);
+    });
+  });
+
+  // Clicking a column header label (not the funnel) toggles sort on that
+  // column — matches the review view where the label is the click target
+  // for sort and the funnel is the click target for filters.
+  document.querySelectorAll('#excluded-table-root thead th[data-field] .th-label').forEach(lbl => {
+    lbl.addEventListener('click', e => {
+      const th = lbl.closest('th[data-field]');
+      if (!th) return;
+      const field = th.dataset.field;
+      if (state.excludedSortCol === field) {
+        state.excludedSortDir = state.excludedSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.excludedSortCol = field;
+        state.excludedSortDir = 'asc';
+      }
+      state.excludedPage = 1;
+      renderExcludedTable();
+    });
+  });
 
   document.querySelectorAll('.excluded-row-check').forEach(cb => {
     cb.addEventListener('change', () => {
@@ -3729,12 +4117,98 @@ function attachExcludedTableEvents() {
 function updateExcludedHdrCheckbox() {
   const hdr = document.getElementById('excluded-hdr-check');
   if (!hdr) return;
-  const ids = state.excludedData.map(r => r.fileID);
+  // Match the review view: header checkbox reflects only the rows on
+  // the current page.  Rows on other pages contribute nothing to the
+  // checked / indeterminate state.
+  const ids = getExcludedPageIds();
   const allSelected = ids.length > 0 && ids.every(id => state.excludedSelectedIds.has(id));
   const someSelected = ids.some(id => state.excludedSelectedIds.has(id));
   hdr.checked = allSelected;
   hdr.indeterminate = !allSelected && someSelected;
   hdr.disabled = ids.length === 0;
+}
+
+/* Render the active-filter chip bar for the Excluded view.  Mirrors
+ * renderActiveFilters() but scoped to state.excludedColumnFilters so the
+ * chips only reflect filters applied inside the Excluded view. */
+function renderExcludedActiveFilters() {
+  const bar = $('excluded-af-bar');
+  if (!bar) return;
+  const chips = Object.entries(state.excludedColumnFilters)
+    .filter(([, f]) => f)
+    .map(([field, f]) => {
+      const col = EXCLUDED_COL_POOL.find(c => c.f === field) || COL_CFG.find(c => c.f === field);
+      const label = col ? col.h : field;
+      let val = '';
+      if (f.type === 'set')  val = f.values.length === 1 ? f.values[0] : `${f.values.length} values`;
+      if (f.type === 'text') val = `${f.op}: "${f.value}"`;
+      if (f.type === 'date') val = f.op === 'between' ? `${f.from} – ${f.to}` : `${f.op} ${f.from}`;
+      return `<span class="af-chip"><span class="af-col">${esc(label)}:</span> ${esc(val)} <button class="af-x" data-field="${esc(field)}">✕</button></span>`;
+    });
+
+  // Folder filter chip — matches the review view's cross-cutting chip
+  // styling so users recognise it as a global filter, not per-column.
+  const ff = state.excludedFolderFilter || {};
+  if (ff.text && ff.text.trim()) {
+    const modeLabel = { contains: 'contains', starts_with: 'starts with', exact: 'exact' }[ff.mode] || 'contains';
+    chips.unshift(
+      `<span class="af-chip af-chip-folder">`
+      + `<span class="af-col">Folder ${esc(modeLabel)}:</span> `
+      + `${esc(ff.text)} `
+      + `<button class="af-x" data-af="folder-filter">✕</button></span>`
+    );
+  }
+
+  if (!chips.length) {
+    bar.innerHTML = '';
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  bar.innerHTML = `<span class="af-label">Filters:</span>${chips.join('')}<button class="af-clear-all" id="excluded-af-clear-all">Clear All</button>`;
+
+  bar.querySelectorAll('.af-x').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.af === 'folder-filter') {
+        state.excludedFolderFilter = { text: '', mode: 'contains' };
+        _syncExcludedFolderFilterButton();
+      } else if (btn.dataset.field) {
+        delete state.excludedColumnFilters[btn.dataset.field];
+      }
+      state.excludedPage = 1;
+      renderExcludedTable();
+    });
+  });
+  const clearAll = $('excluded-af-clear-all');
+  if (clearAll) clearAll.addEventListener('click', clearExcludedFilters);
+}
+
+/* Enable / disable the Clear Filters toolbar button based on whether any
+ * filter or search term is currently active in the Excluded view. */
+function updateExcludedClearFiltersBtn() {
+  const btn = $('excluded-clear-filters-btn');
+  if (!btn) return;
+  const ff = state.excludedFolderFilter || {};
+  const hasFilters = Object.values(state.excludedColumnFilters).some(Boolean)
+                     || (state.excludedSearch || '').trim() !== ''
+                     || !!state.excludedSortCol
+                     || !!(ff.text && ff.text.trim());
+  btn.disabled = !hasFilters;
+}
+
+/* Reset every filter/search/sort applied inside the Excluded view.  Called
+ * by the Clear Filters button and the "Clear All" chip. */
+function clearExcludedFilters() {
+  state.excludedColumnFilters = {};
+  state.excludedSearch = '';
+  state.excludedSortCol = null;
+  state.excludedSortDir = 'asc';
+  state.excludedFolderFilter = { text: '', mode: 'contains' };
+  state.excludedPage = 1;
+  _syncExcludedFolderFilterButton();
+  const input = $('excluded-search-input');
+  if (input) input.value = '';
+  renderExcludedTable();
 }
 
 function updateExcludedToolbar() {
@@ -3785,6 +4259,15 @@ async function showExcludedView() {
       showToast('Unable to load excluded documents.');
     }
   }
+
+  // Sync the search input with any previously-typed query so the toolbar
+  // reflects state across view switches.
+  const searchEl = $('excluded-search-input');
+  if (searchEl) searchEl.value = state.excludedSearch || '';
+
+  // Sync the Folder Filter button label / active-highlight in case the
+  // user set a filter in a previous session (persisted in-memory only).
+  _syncExcludedFolderFilterButton();
 
   renderExcludedTable();
   updateExcludedToolbar();
@@ -4186,7 +4669,11 @@ async function exportCsv() {
   //                               are all subsets of the active set).
   let rows;
   if (state.currentView === 'excluded') {
-    rows = state.excludedData || [];
+    // Respect the current search / column filters / sort so the exported
+    // CSV matches exactly what the user sees.  When no filters are
+    // active, applyExcludedFiltersAndSort() returns the full set.
+    applyExcludedFiltersAndSort();
+    rows = state.excludedFilteredData || state.excludedData || [];
   } else if (state.bucketFilter === 'all') {
     try {
       const res = await fetch('/api/contracts?include_excluded=1',
@@ -4336,6 +4823,48 @@ function initReviewEventListeners() {
   // only excluded records" works without a second export implementation.
   const exclExportBtn = $('excluded-export-csv-btn');
   if (exclExportBtn) exclExportBtn.addEventListener('click', exportCsv);
+
+  // ── Excluded view toolbar wiring ─────────────────────────────────────
+  // Mirrors the review-view search / Clear Filters behaviour but writes
+  // to the excluded-view state so the two filters stay independent.
+  const exclSearch = $('excluded-search-input');
+  if (exclSearch) {
+    exclSearch.addEventListener('input', () => {
+      state.excludedSearch = exclSearch.value;
+      // User-initiated filter change — reset to page 1 so results the
+      // user just filtered for are visible immediately.  (Auto refresh
+      // paths intentionally rely on the clamping in renderExcludedTable
+      // to preserve the current page.)
+      state.excludedPage = 1;
+      renderExcludedTable();
+    });
+  }
+  const exclSearchClear = $('excluded-search-clear');
+  if (exclSearchClear) {
+    exclSearchClear.addEventListener('click', () => {
+      state.excludedSearch = '';
+      if (exclSearch) exclSearch.value = '';
+      state.excludedPage = 1;
+      renderExcludedTable();
+    });
+  }
+  const exclClearFiltersBtn = $('excluded-clear-filters-btn');
+  if (exclClearFiltersBtn) exclClearFiltersBtn.addEventListener('click', clearExcludedFilters);
+
+  // Excluded Columns picker — reuses the shared openColPanel() which
+  // routes to the excluded pool when state.currentView === 'excluded'.
+  const exclColBtn = $('excluded-col-btn');
+  if (exclColBtn) exclColBtn.addEventListener('click', openColPanel);
+
+  // Excluded Folder Filter button — reuses the same popover
+  // (openFolderFilterPanel is view-aware).
+  const exclFolderFilterBtn = $('excluded-folder-filter-btn');
+  if (exclFolderFilterBtn) exclFolderFilterBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    if (document.getElementById('folder-filter-panel')) closeFolderFilterPanel();
+    else openFolderFilterPanel();
+  });
+
   // (Removed) "All Contracts" folder navigator button + dropdown wiring —
   // the hierarchical folder browser was retired per manager request.
   // Global folder filter (Philippe requirement) — searches Folder 1..20
